@@ -10,7 +10,8 @@ Use this skill when GPT Image 2 should run through the user's configured relay i
 ## Defaults
 
 - Model: `gpt-image-2`
-- Relay config source order: environment variables, then `~/.codex/gpt-image-2-relay-auth.json`, then `~/.codex/auth.json` plus `~/.codex/config.toml`
+- Primary relay config: `~/.codex/auth.json` for `OPENAI_API_KEY`, plus `~/.codex/config.toml` for the current provider `base_url`
+- Fallback relay config: `~/.codex/gpt-image-2-relay-auth.json`, or a named profile file, used only after the primary GPT Image 2 API call fails
 - API key fields: `OPENAI_API_KEY` or `api_key`
 - Relay base URL fields: `OPENAI_BASE_URL`, `base_url`, `BASE_URL`, or `url`
 - Named profile files: `~/.codex/gpt-image-2-relay-<profile>.json`
@@ -23,7 +24,14 @@ Never print, echo, persist, or place API keys in command arguments. The wrapper 
 
 ## Relay Config
 
-Default single-relay config:
+Primary config is tried first:
+
+```text
+~/.codex/auth.json
+~/.codex/config.toml
+```
+
+Fallback config is tried only after the primary GPT Image 2 API call fails. Default fallback file:
 
 ```json
 {
@@ -32,7 +40,7 @@ Default single-relay config:
 }
 ```
 
-Multiple relay keys can be kept in separate profile files:
+Multiple fallback relay keys can be kept in separate profile files:
 
 ```text
 ~/.codex/gpt-image-2-relay-work.json
@@ -48,7 +56,7 @@ Each file uses the same JSON shape:
 }
 ```
 
-Use a profile with:
+Use a fallback profile with:
 
 ```bash
 python "${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-relay/scripts/generate.py" \
@@ -57,7 +65,9 @@ python "${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-relay/scripts/generate.py
   --filename "$FILENAME"
 ```
 
-Alternatively, put multiple profiles in `~/.codex/gpt-image-2-relay-auth.json`:
+The primary config still runs first; the profile is tried only if that primary API call fails.
+
+Alternatively, put multiple fallback profiles in `~/.codex/gpt-image-2-relay-auth.json`:
 
 ```json
 {

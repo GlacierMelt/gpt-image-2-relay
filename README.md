@@ -15,13 +15,16 @@ Restart Codex after installation.
 
 ## Configure
 
-Provide an API key in one of these ways:
+By default, the skill first uses your normal Codex config:
 
-```bash
-export OPENAI_API_KEY="sk-..."
+```text
+~/.codex/auth.json
+~/.codex/config.toml
 ```
 
-or create:
+If that primary GPT Image 2 API call fails, the wrapper can retry with a fallback relay config.
+
+Create:
 
 ```text
 ~/.codex/gpt-image-2-relay-auth.json
@@ -36,13 +39,14 @@ with:
 }
 ```
 
-The base URL can also be provided separately with:
+You can still override the primary run with environment variables:
 
 ```bash
+export OPENAI_API_KEY="sk-..."
 export OPENAI_BASE_URL="https://your-relay.example/v1"
 ```
 
-or configure `~/.codex/config.toml`:
+or configure `~/.codex/config.toml` for the primary run:
 
 ```toml
 model_provider = "custom"
@@ -55,7 +59,7 @@ Do not commit API keys or private relay credentials.
 
 ## Multiple Relay Profiles
 
-Use separate files when you have multiple relay keys:
+Use separate fallback files when you have multiple relay keys:
 
 ```text
 ~/.codex/gpt-image-2-relay-work.json
@@ -71,7 +75,7 @@ Each file uses:
 }
 ```
 
-Then select one with:
+Then select one as fallback with:
 
 ```bash
 python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
@@ -80,7 +84,9 @@ python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
   --filename apple.png
 ```
 
-You can also keep profiles inside `~/.codex/gpt-image-2-relay-auth.json`:
+The primary `~/.codex/auth.json` + `~/.codex/config.toml` run still happens first. The selected profile is retried only if the primary GPT Image 2 API call fails.
+
+You can also keep fallback profiles inside `~/.codex/gpt-image-2-relay-auth.json`:
 
 ```json
 {

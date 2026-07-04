@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -79,26 +80,8 @@ def extract_profile(data: dict[str, Any], profile: str, source: Path) -> dict[st
     return value
 
 
-def resolve_profile_config(image_auth_path: Path, auth_path: Path, profile: str | None) -> dict[str, Any]:
-    if profile:
-        selected_profile_path = profile_file(image_auth_path, profile)
-        if selected_profile_path.exists():
-            return read_json_object(selected_profile_path, required=True)
-        default_data = read_json_object(image_auth_path)
-        inline_profile = extract_profile(default_data, profile, image_auth_path)
-        if inline_profile:
-            return inline_profile
-        fail(
-            f"profile {profile!r} not found. Expected {selected_profile_path} "
-            f"or profiles.{profile} in {image_auth_path}"
-        )
-    if image_auth_path.exists():
-        return read_json_object(image_auth_path, required=True)
-    return read_json_object(auth_path, required=True)
-
-
-def resolve_api_key(config: dict[str, Any]) -> str:
-    env_key = os.environ.get("OPENAI_API_KEY")
+def resolve_api_key(config: dict[str, Any], allow_env: bool = True) -> str:
+    env_key = os.environ.get("OPENAI_API_KEY") if allow_env else None
     if env_key:
         return env_key.strip()
     value = config.get("OPENAI_API_KEY") or config.get("api_key")
@@ -113,6 +96,26 @@ def base_url_from_config(config: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def resolve_relay_auth_config(image_auth_path: Path, profile: str | None, required: bool = False) -> dict[str, Any]:
+    if profile:
+        selected_profile_path = profile_file(image_auth_path, profile)
+        if selected_profile_path.exists():
+            return read_json_object(selected_profile_path, required=True)
+        default_data = read_json_object(image_auth_path)
+        inline_profile = extract_profile(default_data, profile, image_auth_path)
+        if inline_profile:
+            return inline_profile
+        if required:
+            fail(
+                f"profile {profile!r} not found. Expected {selected_profile_path} "
+                f"or profiles.{profile} in {image_auth_path}"
+            )
+        return {}
+    if image_auth_path.exists():
+        return read_json_object(image_auth_path, required=True)
+    return {}
 
 
 def _parse_scalar(value: str) -> Any:
@@ -193,6 +196,10 @@ def read_base_url(path: Path, provider: str | None) -> str:
 def ensure_runtime(workspace: Path, requested_python: str | None, skip_install: bool) -> Path:
     if requested_python:
         py = Path(requested_python).expanduser()
+        if not py.exists() and os.sep not in requested_python:
+            found = shutil.which(requested_python)
+            if found:
+                return Path(found)
         if not py.exists():
             fail(f"requested Python does not exist: {py}")
         return py
@@ -323,6 +330,48 @@ def build_command(args: argparse.Namespace, python_path: Path, cli_path: Path, o
     return cmd
 
 
+def run_image_command(
+    *,
+    label: str,
+    cmd: list[str],
+    api_key: str,
+    base_url: str,
+    out: Path,
+    args: argparse.Namespace,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["OPENAI_API_KEY"] = api_key
+    env["OPENAI_BASE_URL"] = base_url
+
+    print(f"Using {label} relay base URL: {base_url}")
+    print(f"Writing output: {out}")
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+    stdout = sanitize(result.stdout, api_key)
+    stderr = sanitize(result.stderr, api_key)
+    if stdout:
+        print(stdout, end="" if stdout.endswith("\n") else "\n")
+    if stderr:
+        print(stderr, end="" if stderr.endswith("\n") else "\n", file=sys.stderr)
+    if result.returncode == 0 and args.dry_run:
+        print(f"Dry-run output path: {out}")
+    elif result.returncode == 0:
+        print(f"Final output: {out}")
+    return result
+
+
+def api_call_was_attempted(result: subprocess.CompletedProcess[str]) -> bool:
+    combined = f"{result.stdout}\n{result.stderr}"
+    return (
+        "Calling Image API" in combined
+        or "Error code:" in combined
+        or "openai." in combined
+        or "AuthenticationError" in combined
+        or "APIConnectionError" in combined
+        or "APITimeoutError" in combined
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate or edit GPT Image 2 images through the configured relay.")
     parser.add_argument("--mode", choices=["auto", "generate", "edit"], default="auto")
@@ -336,7 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", help="Workspace root; default: current directory")
     parser.add_argument("--auth-json", default=str(DEFAULT_AUTH_JSON))
     parser.add_argument("--image-auth-json", default=str(DEFAULT_IMAGE_AUTH_JSON))
-    parser.add_argument("--profile", help="Named relay profile. Reads ~/.codex/gpt-image-2-relay-<profile>.json or profiles.<profile> from --image-auth-json.")
+    parser.add_argument("--profile", help="Named fallback relay profile. Reads ~/.codex/gpt-image-2-relay-<profile>.json or profiles.<profile> from --image-auth-json after the primary config fails.")
     parser.add_argument("--config-toml", default=str(DEFAULT_CONFIG_TOML))
     parser.add_argument("--provider", help="Model provider table name in config.toml; default: top-level model_provider")
     parser.add_argument("--python", help="Python executable to run the bundled imagegen CLI")
@@ -373,40 +422,57 @@ def main() -> int:
     workspace = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
-    selected_config = resolve_profile_config(
-        Path(args.image_auth_json).expanduser(),
-        Path(args.auth_json).expanduser(),
+    auth_path = Path(args.auth_json).expanduser()
+    image_auth_path = Path(args.image_auth_json).expanduser()
+    config_path = Path(args.config_toml).expanduser()
+
+    primary_config = read_json_object(auth_path, required=True)
+    fallback_config = resolve_relay_auth_config(
+        image_auth_path,
         args.profile,
+        required=bool(args.profile),
     )
-    api_key = resolve_api_key(selected_config)
-    base_url = (
-        os.environ.get("OPENAI_BASE_URL")
-        or base_url_from_config(selected_config)
-        or read_base_url(Path(args.config_toml).expanduser(), args.provider)
-    )
+
+    api_key = resolve_api_key(primary_config, allow_env=True)
+    base_url = os.environ.get("OPENAI_BASE_URL") or read_base_url(config_path, args.provider)
+    fallback_api_key = resolve_api_key(fallback_config, allow_env=False) if fallback_config else None
+    fallback_base_url = (
+        base_url_from_config(fallback_config)
+        or os.environ.get("OPENAI_BASE_URL")
+        or read_base_url(config_path, args.provider)
+    ) if fallback_config else None
+
     python_path = ensure_runtime(workspace, args.python, args.skip_install)
     cli_path = Path(args.image_cli).expanduser()
     out = choose_output(args, workspace)
     cmd = build_command(args, python_path, cli_path, out, workspace)
 
-    env = os.environ.copy()
-    env["OPENAI_API_KEY"] = api_key
-    env["OPENAI_BASE_URL"] = base_url
-
-    print(f"Using relay base URL: {base_url}")
-    print(f"Writing output: {out}")
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-
-    stdout = sanitize(result.stdout, api_key)
-    stderr = sanitize(result.stderr, api_key)
-    if stdout:
-        print(stdout, end="" if stdout.endswith("\n") else "\n")
-    if stderr:
-        print(stderr, end="" if stderr.endswith("\n") else "\n", file=sys.stderr)
-    if result.returncode == 0 and args.dry_run:
-        print(f"Dry-run output path: {out}")
-    elif result.returncode == 0:
-        print(f"Final output: {out}")
+    result = run_image_command(
+        label="primary",
+        cmd=cmd,
+        api_key=api_key,
+        base_url=base_url,
+        out=out,
+        args=args,
+    )
+    if (
+        result.returncode != 0
+        and not args.dry_run
+        and fallback_config
+        and fallback_api_key
+        and fallback_base_url
+        and (fallback_api_key != api_key or fallback_base_url != base_url)
+        and api_call_was_attempted(result)
+    ):
+        print("Primary GPT Image 2 call failed; retrying with fallback relay config.", file=sys.stderr)
+        result = run_image_command(
+            label="fallback",
+            cmd=cmd,
+            api_key=fallback_api_key,
+            base_url=fallback_base_url,
+            out=out,
+            args=args,
+        )
     return result.returncode
 
 
