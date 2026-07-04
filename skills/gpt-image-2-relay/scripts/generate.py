@@ -22,6 +22,7 @@ DEFAULT_IMAGE_AUTH_JSON = Path.home() / ".codex" / "gpt-image-2-relay-auth.json"
 DEFAULT_CONFIG_TOML = Path.home() / ".codex" / "config.toml"
 DEFAULT_MODEL = "gpt-image-2"
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
+BASE_URL_KEYS = ("OPENAI_BASE_URL", "base_url", "BASE_URL", "url")
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -48,13 +49,70 @@ def read_api_key(path: Path) -> str:
     return value.strip()
 
 
-def resolve_api_key(image_auth_path: Path, auth_path: Path) -> str:
+def read_json_object(path: Path, required: bool = False) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        if required:
+            fail(f"auth file not found: {path}")
+        return {}
+    except json.JSONDecodeError as exc:
+        fail(f"auth file is not valid JSON: {path}: {exc}")
+    if not isinstance(data, dict):
+        fail(f"auth file must contain a JSON object: {path}")
+    return data
+
+
+def profile_file(base_path: Path, profile: str) -> Path:
+    return base_path.with_name(f"{base_path.stem}-{profile}{base_path.suffix}")
+
+
+def extract_profile(data: dict[str, Any], profile: str, source: Path) -> dict[str, Any]:
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        return {}
+    value = profiles.get(profile)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        fail(f"profile {profile!r} in {source} must be a JSON object")
+    return value
+
+
+def resolve_profile_config(image_auth_path: Path, auth_path: Path, profile: str | None) -> dict[str, Any]:
+    if profile:
+        selected_profile_path = profile_file(image_auth_path, profile)
+        if selected_profile_path.exists():
+            return read_json_object(selected_profile_path, required=True)
+        default_data = read_json_object(image_auth_path)
+        inline_profile = extract_profile(default_data, profile, image_auth_path)
+        if inline_profile:
+            return inline_profile
+        fail(
+            f"profile {profile!r} not found. Expected {selected_profile_path} "
+            f"or profiles.{profile} in {image_auth_path}"
+        )
+    if image_auth_path.exists():
+        return read_json_object(image_auth_path, required=True)
+    return read_json_object(auth_path, required=True)
+
+
+def resolve_api_key(config: dict[str, Any]) -> str:
     env_key = os.environ.get("OPENAI_API_KEY")
     if env_key:
         return env_key.strip()
-    if image_auth_path.exists():
-        return read_api_key(image_auth_path)
-    return read_api_key(auth_path)
+    value = config.get("OPENAI_API_KEY") or config.get("api_key")
+    if not isinstance(value, str) or not value.strip():
+        fail("OPENAI_API_KEY missing in selected relay config")
+    return value.strip()
+
+
+def base_url_from_config(config: dict[str, Any]) -> str | None:
+    for key in BASE_URL_KEYS:
+        value = config.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _parse_scalar(value: str) -> Any:
@@ -278,6 +336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", help="Workspace root; default: current directory")
     parser.add_argument("--auth-json", default=str(DEFAULT_AUTH_JSON))
     parser.add_argument("--image-auth-json", default=str(DEFAULT_IMAGE_AUTH_JSON))
+    parser.add_argument("--profile", help="Named relay profile. Reads ~/.codex/gpt-image-2-relay-<profile>.json or profiles.<profile> from --image-auth-json.")
     parser.add_argument("--config-toml", default=str(DEFAULT_CONFIG_TOML))
     parser.add_argument("--provider", help="Model provider table name in config.toml; default: top-level model_provider")
     parser.add_argument("--python", help="Python executable to run the bundled imagegen CLI")
@@ -314,8 +373,17 @@ def main() -> int:
     workspace = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
-    api_key = resolve_api_key(Path(args.image_auth_json).expanduser(), Path(args.auth_json).expanduser())
-    base_url = os.environ.get("OPENAI_BASE_URL") or read_base_url(Path(args.config_toml).expanduser(), args.provider)
+    selected_config = resolve_profile_config(
+        Path(args.image_auth_json).expanduser(),
+        Path(args.auth_json).expanduser(),
+        args.profile,
+    )
+    api_key = resolve_api_key(selected_config)
+    base_url = (
+        os.environ.get("OPENAI_BASE_URL")
+        or base_url_from_config(selected_config)
+        or read_base_url(Path(args.config_toml).expanduser(), args.provider)
+    )
     python_path = ensure_runtime(workspace, args.python, args.skip_install)
     cli_path = Path(args.image_cli).expanduser()
     out = choose_output(args, workspace)

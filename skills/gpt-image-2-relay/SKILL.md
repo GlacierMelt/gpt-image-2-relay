@@ -10,14 +10,69 @@ Use this skill when GPT Image 2 should run through the user's configured relay i
 ## Defaults
 
 - Model: `gpt-image-2`
-- API key source order: `OPENAI_API_KEY` environment variable, then `~/.codex/gpt-image-2-relay-auth.json`, then `~/.codex/auth.json`; JSON field `OPENAI_API_KEY`
-- Relay base URL source: `OPENAI_BASE_URL` environment variable, then `~/.codex/config.toml`, current `model_provider` table such as `[model_providers.custom].base_url`
+- Relay config source order: environment variables, then `~/.codex/gpt-image-2-relay-auth.json`, then `~/.codex/auth.json` plus `~/.codex/config.toml`
+- API key fields: `OPENAI_API_KEY` or `api_key`
+- Relay base URL fields: `OPENAI_BASE_URL`, `base_url`, `BASE_URL`, or `url`
+- Named profile files: `~/.codex/gpt-image-2-relay-<profile>.json`
 - Wrapper script: `scripts/generate.py`
 - Underlying CLI: `${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/scripts/image_gen.py`
 - Output directory: current workspace `$PWD/outputs`
 - Python environment: current workspace `$PWD/work/.venv`
 
 Never print, echo, persist, or place API keys in command arguments. The wrapper reads the key and passes it to the child process through environment variables. If an API error includes a key-like value, redact it before showing the user.
+
+## Relay Config
+
+Default single-relay config:
+
+```json
+{
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_BASE_URL": "https://your-relay.example/v1"
+}
+```
+
+Multiple relay keys can be kept in separate profile files:
+
+```text
+~/.codex/gpt-image-2-relay-work.json
+~/.codex/gpt-image-2-relay-personal.json
+```
+
+Each file uses the same JSON shape:
+
+```json
+{
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_BASE_URL": "https://your-relay.example/v1"
+}
+```
+
+Use a profile with:
+
+```bash
+python "${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-relay/scripts/generate.py" \
+  --profile work \
+  --prompt "$PROMPT" \
+  --filename "$FILENAME"
+```
+
+Alternatively, put multiple profiles in `~/.codex/gpt-image-2-relay-auth.json`:
+
+```json
+{
+  "profiles": {
+    "work": {
+      "OPENAI_API_KEY": "sk-...",
+      "OPENAI_BASE_URL": "https://work-relay.example/v1"
+    },
+    "personal": {
+      "OPENAI_API_KEY": "sk-...",
+      "OPENAI_BASE_URL": "https://personal-relay.example/v1"
+    }
+  }
+}
+```
 
 ## Workflow
 

@@ -31,11 +31,12 @@ with:
 
 ```json
 {
-  "OPENAI_API_KEY": "sk-..."
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_BASE_URL": "https://your-relay.example/v1"
 }
 ```
 
-Provide the relay base URL in one of these ways:
+The base URL can also be provided separately with:
 
 ```bash
 export OPENAI_BASE_URL="https://your-relay.example/v1"
@@ -51,6 +52,50 @@ base_url = "https://your-relay.example/v1"
 ```
 
 Do not commit API keys or private relay credentials.
+
+## Multiple Relay Profiles
+
+Use separate files when you have multiple relay keys:
+
+```text
+~/.codex/gpt-image-2-relay-work.json
+~/.codex/gpt-image-2-relay-personal.json
+```
+
+Each file uses:
+
+```json
+{
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_BASE_URL": "https://your-relay.example/v1"
+}
+```
+
+Then select one with:
+
+```bash
+python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
+  --profile work \
+  --prompt "A red apple on a white background" \
+  --filename apple.png
+```
+
+You can also keep profiles inside `~/.codex/gpt-image-2-relay-auth.json`:
+
+```json
+{
+  "profiles": {
+    "work": {
+      "OPENAI_API_KEY": "sk-...",
+      "OPENAI_BASE_URL": "https://work-relay.example/v1"
+    },
+    "personal": {
+      "OPENAI_API_KEY": "sk-...",
+      "OPENAI_BASE_URL": "https://personal-relay.example/v1"
+    }
+  }
+}
+```
 
 ## Use
 
