@@ -69,8 +69,8 @@ Do not commit API keys or private relay credentials. Keep filled auth JSON files
 Use separate fallback files when you have multiple relay keys:
 
 ```text
-~/.codex/gpt-image-2-relay-work.json
-~/.codex/gpt-image-2-relay-personal.json
+~/.codex/gpt-image-2-relay-auth-work.json
+~/.codex/gpt-image-2-relay-auth-personal.json
 ```
 
 Each file uses:

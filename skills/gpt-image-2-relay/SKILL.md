@@ -15,7 +15,7 @@ Use this skill when GPT Image 2 should run through the user's configured relay i
 - Missing fallback auth files are created as local empty templates when `--init-auth` is used, or after a failed primary API call when fallback is needed
 - API key fields: `OPENAI_API_KEY` or `api_key`
 - Relay base URL fields: `OPENAI_BASE_URL`, `base_url`, `BASE_URL`, or `url`
-- Named profile files: `~/.codex/gpt-image-2-relay-<profile>.json`
+- Named profile files: `~/.codex/gpt-image-2-relay-auth-<profile>.json`
 - Wrapper script: `scripts/generate.py`
 - Underlying CLI: `${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/scripts/image_gen.py`
 - Output directory: current workspace `$PWD/outputs`
@@ -59,8 +59,8 @@ Never add filled auth JSON files to the skill folder, workspace, or GitHub repos
 Multiple fallback relay keys can be kept in separate profile files:
 
 ```text
-~/.codex/gpt-image-2-relay-work.json
-~/.codex/gpt-image-2-relay-personal.json
+~/.codex/gpt-image-2-relay-auth-work.json
+~/.codex/gpt-image-2-relay-auth-personal.json
 ```
 
 Each file uses the same JSON shape:
@@ -162,7 +162,7 @@ For edits, prefer `--size` larger than the source when the user asks to increase
 - `--use-case`, `--style`, `--composition`, `--lighting`, `--constraints`, `--negative`: Prompt augmentation hints passed through to the underlying imagegen CLI.
 - `--dry-run`: Validate command construction without calling the API.
 - `--force`: Allow replacing the selected output path.
-- `--init-auth`: Create a local empty fallback auth template at `~/.codex/gpt-image-2-relay-auth.json`, or at `~/.codex/gpt-image-2-relay-<profile>.json` with `--profile`, then exit.
+- `--init-auth`: Create a local empty fallback auth template at `~/.codex/gpt-image-2-relay-auth.json`, or at `~/.codex/gpt-image-2-relay-auth-<profile>.json` with `--profile`, then exit.
 
 ## Transparent Backgrounds
 
