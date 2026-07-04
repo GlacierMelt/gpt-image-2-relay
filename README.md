@@ -22,20 +22,27 @@ By default, the skill first uses your normal Codex config:
 ~/.codex/config.toml
 ```
 
-If that primary GPT Image 2 API call fails, the wrapper can retry with a fallback relay config.
+If that primary GPT Image 2 API call fails, the wrapper can retry with a fallback relay config. If the fallback file is missing when fallback is needed, the wrapper creates a local empty template automatically and tells you where to fill it.
 
-Create:
+Create the template anytime with:
+
+```bash
+python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py --init-auth
+```
+
+Default fallback file:
 
 ```text
 ~/.codex/gpt-image-2-relay-auth.json
 ```
 
-with:
+Fill it locally:
 
 ```json
 {
-  "OPENAI_API_KEY": "sk-...",
-  "OPENAI_BASE_URL": "https://your-relay.example/v1"
+  "_instructions": "Fill OPENAI_API_KEY. Fill OPENAI_BASE_URL if this fallback should use a different relay; leave it empty to reuse ~/.codex/config.toml. Keep this file in ~/.codex and do not commit it.",
+  "OPENAI_API_KEY": "",
+  "OPENAI_BASE_URL": ""
 }
 ```
 
@@ -55,7 +62,7 @@ model_provider = "custom"
 base_url = "https://your-relay.example/v1"
 ```
 
-Do not commit API keys or private relay credentials.
+Do not commit API keys or private relay credentials. Keep filled auth JSON files in `~/.codex`, not inside this GitHub repo.
 
 ## Multiple Relay Profiles
 
@@ -70,9 +77,16 @@ Each file uses:
 
 ```json
 {
-  "OPENAI_API_KEY": "sk-...",
-  "OPENAI_BASE_URL": "https://your-relay.example/v1"
+  "_instructions": "Fill OPENAI_API_KEY. Fill OPENAI_BASE_URL if this fallback should use a different relay; leave it empty to reuse ~/.codex/config.toml. Keep this file in ~/.codex and do not commit it.",
+  "OPENAI_API_KEY": "",
+  "OPENAI_BASE_URL": ""
 }
+```
+
+Create an empty profile template with:
+
+```bash
+python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py --init-auth --profile work
 ```
 
 Then select one as fallback with:
@@ -92,12 +106,12 @@ You can also keep fallback profiles inside `~/.codex/gpt-image-2-relay-auth.json
 {
   "profiles": {
     "work": {
-      "OPENAI_API_KEY": "sk-...",
-      "OPENAI_BASE_URL": "https://work-relay.example/v1"
+      "OPENAI_API_KEY": "",
+      "OPENAI_BASE_URL": ""
     },
     "personal": {
-      "OPENAI_API_KEY": "sk-...",
-      "OPENAI_BASE_URL": "https://personal-relay.example/v1"
+      "OPENAI_API_KEY": "",
+      "OPENAI_BASE_URL": ""
     }
   }
 }

@@ -12,6 +12,7 @@ Use this skill when GPT Image 2 should run through the user's configured relay i
 - Model: `gpt-image-2`
 - Primary relay config: `~/.codex/auth.json` for `OPENAI_API_KEY`, plus `~/.codex/config.toml` for the current provider `base_url`
 - Fallback relay config: `~/.codex/gpt-image-2-relay-auth.json`, or a named profile file, used only after the primary GPT Image 2 API call fails
+- Missing fallback auth files are created as local empty templates when `--init-auth` is used, or after a failed primary API call when fallback is needed
 - API key fields: `OPENAI_API_KEY` or `api_key`
 - Relay base URL fields: `OPENAI_BASE_URL`, `base_url`, `BASE_URL`, or `url`
 - Named profile files: `~/.codex/gpt-image-2-relay-<profile>.json`
@@ -31,14 +32,29 @@ Primary config is tried first:
 ~/.codex/config.toml
 ```
 
-Fallback config is tried only after the primary GPT Image 2 API call fails. Default fallback file:
+Fallback config is tried only after the primary GPT Image 2 API call fails. If the file is missing when fallback is needed, the wrapper creates a local template at:
+
+```text
+~/.codex/gpt-image-2-relay-auth.json
+```
+
+Create or refresh the template without making an API call:
+
+```bash
+python "${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-relay/scripts/generate.py" --init-auth
+```
+
+Fill the template locally:
 
 ```json
 {
-  "OPENAI_API_KEY": "sk-...",
-  "OPENAI_BASE_URL": "https://your-relay.example/v1"
+  "_instructions": "Fill OPENAI_API_KEY. Fill OPENAI_BASE_URL if this fallback should use a different relay; leave it empty to reuse ~/.codex/config.toml. Keep this file in ~/.codex and do not commit it.",
+  "OPENAI_API_KEY": "",
+  "OPENAI_BASE_URL": ""
 }
 ```
+
+Never add filled auth JSON files to the skill folder, workspace, or GitHub repository.
 
 Multiple fallback relay keys can be kept in separate profile files:
 
@@ -51,8 +67,8 @@ Each file uses the same JSON shape:
 
 ```json
 {
-  "OPENAI_API_KEY": "sk-...",
-  "OPENAI_BASE_URL": "https://your-relay.example/v1"
+  "OPENAI_API_KEY": "",
+  "OPENAI_BASE_URL": ""
 }
 ```
 
@@ -67,18 +83,24 @@ python "${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-relay/scripts/generate.py
 
 The primary config still runs first; the profile is tried only if that primary API call fails.
 
+Create an empty profile template with:
+
+```bash
+python "${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-relay/scripts/generate.py" --init-auth --profile work
+```
+
 Alternatively, put multiple fallback profiles in `~/.codex/gpt-image-2-relay-auth.json`:
 
 ```json
 {
   "profiles": {
     "work": {
-      "OPENAI_API_KEY": "sk-...",
-      "OPENAI_BASE_URL": "https://work-relay.example/v1"
+      "OPENAI_API_KEY": "",
+      "OPENAI_BASE_URL": ""
     },
     "personal": {
-      "OPENAI_API_KEY": "sk-...",
-      "OPENAI_BASE_URL": "https://personal-relay.example/v1"
+      "OPENAI_API_KEY": "",
+      "OPENAI_BASE_URL": ""
     }
   }
 }
@@ -140,6 +162,7 @@ For edits, prefer `--size` larger than the source when the user asks to increase
 - `--use-case`, `--style`, `--composition`, `--lighting`, `--constraints`, `--negative`: Prompt augmentation hints passed through to the underlying imagegen CLI.
 - `--dry-run`: Validate command construction without calling the API.
 - `--force`: Allow replacing the selected output path.
+- `--init-auth`: Create a local empty fallback auth template at `~/.codex/gpt-image-2-relay-auth.json`, or at `~/.codex/gpt-image-2-relay-<profile>.json` with `--profile`, then exit.
 
 ## Transparent Backgrounds
 
@@ -148,6 +171,7 @@ Do not request `background=transparent` with `gpt-image-2`; the model does not s
 ## Failure Handling
 
 - If authentication fails, tell the user the configured relay key appears invalid for the configured relay; do not print the key.
+- If fallback config is missing, the wrapper creates an empty local template and tells the user to fill `OPENAI_API_KEY` and `OPENAI_BASE_URL`; do not ask them to put credentials in the GitHub repo.
 - If the relay returns `model_not_found`, tell the user the configured relay/account/group does not expose `gpt-image-2`.
 - If dependency installation fails, report that `$PWD/work/.venv` could not install `openai`.
 - If an output already exists and replacement was not requested, rerun with a unique filename or pass `--force` only when the user explicitly wants replacement.

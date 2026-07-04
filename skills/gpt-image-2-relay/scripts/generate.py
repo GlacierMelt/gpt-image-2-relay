@@ -24,6 +24,11 @@ DEFAULT_CONFIG_TOML = Path.home() / ".codex" / "config.toml"
 DEFAULT_MODEL = "gpt-image-2"
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
 BASE_URL_KEYS = ("OPENAI_BASE_URL", "base_url", "BASE_URL", "url")
+AUTH_TEMPLATE_INSTRUCTIONS = (
+    "Fill OPENAI_API_KEY. Fill OPENAI_BASE_URL if this fallback should use a "
+    "different relay; leave it empty to reuse ~/.codex/config.toml. Keep this "
+    "file in ~/.codex and do not commit it."
+)
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -80,13 +85,44 @@ def extract_profile(data: dict[str, Any], profile: str, source: Path) -> dict[st
     return value
 
 
-def resolve_api_key(config: dict[str, Any], allow_env: bool = True) -> str:
+def write_auth_template(path: Path) -> bool:
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    template = {
+        "_instructions": AUTH_TEMPLATE_INSTRUCTIONS,
+        "OPENAI_API_KEY": "",
+        "OPENAI_BASE_URL": "",
+    }
+    path.write_text(json.dumps(template, indent=2) + "\n")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return True
+
+
+def fail_with_auth_template(path: Path, reason: str, profile: str | None = None) -> None:
+    created = write_auth_template(path)
+    target = f"fallback relay profile {profile!r}" if profile else "fallback relay config"
+    action = "Created" if created else "Use"
+    fail(
+        f"{reason}. {action} {target} template at {path}. "
+        "Fill OPENAI_API_KEY and OPENAI_BASE_URL with your relay key/base URL, then rerun. "
+        "Keep this file outside the GitHub repo; do not commit private credentials."
+    )
+
+
+def resolve_api_key(config: dict[str, Any], allow_env: bool = True, source: str = "selected relay config") -> str:
     env_key = os.environ.get("OPENAI_API_KEY") if allow_env else None
     if env_key:
         return env_key.strip()
     value = config.get("OPENAI_API_KEY") or config.get("api_key")
     if not isinstance(value, str) or not value.strip():
-        fail("OPENAI_API_KEY missing in selected relay config")
+        fail(
+            f"OPENAI_API_KEY missing in {source}. "
+            "Fill that local auth file with your relay key/base URL, then rerun."
+        )
     return value.strip()
 
 
@@ -98,24 +134,32 @@ def base_url_from_config(config: dict[str, Any]) -> str | None:
     return None
 
 
-def resolve_relay_auth_config(image_auth_path: Path, profile: str | None, required: bool = False) -> dict[str, Any]:
+def resolve_relay_auth_config(
+    image_auth_path: Path,
+    profile: str | None,
+    create_missing: bool = False,
+) -> tuple[dict[str, Any], str | None]:
     if profile:
         selected_profile_path = profile_file(image_auth_path, profile)
         if selected_profile_path.exists():
-            return read_json_object(selected_profile_path, required=True)
+            return read_json_object(selected_profile_path, required=True), str(selected_profile_path)
         default_data = read_json_object(image_auth_path)
         inline_profile = extract_profile(default_data, profile, image_auth_path)
         if inline_profile:
-            return inline_profile
-        if required:
-            fail(
+            return inline_profile, f"{image_auth_path} profiles.{profile}"
+        if create_missing:
+            fail_with_auth_template(
+                selected_profile_path,
                 f"profile {profile!r} not found. Expected {selected_profile_path} "
-                f"or profiles.{profile} in {image_auth_path}"
+                f"or profiles.{profile} in {image_auth_path}",
+                profile=profile,
             )
-        return {}
+        return {}, None
     if image_auth_path.exists():
-        return read_json_object(image_auth_path, required=True)
-    return {}
+        return read_json_object(image_auth_path, required=True), str(image_auth_path)
+    if create_missing:
+        fail_with_auth_template(image_auth_path, "fallback relay config not found")
+    return {}, None
 
 
 def _parse_scalar(value: str) -> Any:
@@ -391,6 +435,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python", help="Python executable to run the bundled imagegen CLI")
     parser.add_argument("--image-cli", default=str(default_cli_path()))
     parser.add_argument("--skip-install", action="store_true")
+    parser.add_argument("--init-auth", action="store_true", help="Create a local fallback auth template and exit.")
 
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--size", default="1024x1024")
@@ -426,21 +471,18 @@ def main() -> int:
     image_auth_path = Path(args.image_auth_json).expanduser()
     config_path = Path(args.config_toml).expanduser()
 
-    primary_config = read_json_object(auth_path, required=True)
-    fallback_config = resolve_relay_auth_config(
-        image_auth_path,
-        args.profile,
-        required=bool(args.profile),
-    )
+    if args.init_auth:
+        template_path = profile_file(image_auth_path, args.profile) if args.profile else image_auth_path
+        created = write_auth_template(template_path)
+        action = "Created" if created else "Auth template already exists"
+        print(f"{action}: {template_path}")
+        print("Fill OPENAI_API_KEY and OPENAI_BASE_URL in that local file. Do not commit it.")
+        return 0
 
-    api_key = resolve_api_key(primary_config, allow_env=True)
+    primary_config = read_json_object(auth_path, required=True)
+
+    api_key = resolve_api_key(primary_config, allow_env=True, source=str(auth_path))
     base_url = os.environ.get("OPENAI_BASE_URL") or read_base_url(config_path, args.provider)
-    fallback_api_key = resolve_api_key(fallback_config, allow_env=False) if fallback_config else None
-    fallback_base_url = (
-        base_url_from_config(fallback_config)
-        or os.environ.get("OPENAI_BASE_URL")
-        or read_base_url(config_path, args.provider)
-    ) if fallback_config else None
 
     python_path = ensure_runtime(workspace, args.python, args.skip_install)
     cli_path = Path(args.image_cli).expanduser()
@@ -458,12 +500,29 @@ def main() -> int:
     if (
         result.returncode != 0
         and not args.dry_run
-        and fallback_config
-        and fallback_api_key
-        and fallback_base_url
-        and (fallback_api_key != api_key or fallback_base_url != base_url)
         and api_call_was_attempted(result)
     ):
+        fallback_config, fallback_source = resolve_relay_auth_config(
+            image_auth_path,
+            args.profile,
+            create_missing=True,
+        )
+        fallback_api_key = resolve_api_key(
+            fallback_config,
+            allow_env=False,
+            source=fallback_source or str(image_auth_path),
+        )
+        fallback_base_url = (
+            base_url_from_config(fallback_config)
+            or os.environ.get("OPENAI_BASE_URL")
+            or read_base_url(config_path, args.provider)
+        )
+        if fallback_api_key == api_key and fallback_base_url == base_url:
+            print(
+                "Primary GPT Image 2 call failed; fallback relay config matches the primary config, so no retry was attempted.",
+                file=sys.stderr,
+            )
+            return result.returncode
         print("Primary GPT Image 2 call failed; retrying with fallback relay config.", file=sys.stderr)
         result = run_image_command(
             label="fallback",
