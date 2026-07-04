@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT Image 2 Relay"
+  short_description: "Generate GPT Image 2 assets through your relay."
+  default_prompt: "Use $gpt-image-2-relay to generate a 1024px product-style image from this prompt."
