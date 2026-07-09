@@ -10,10 +10,12 @@ Use this skill when GPT Image 2 should run through the user's configured relay i
 ## Defaults
 
 - Model: `gpt-image-2`
-- Primary relay config: `~/.codex/auth.json` for `OPENAI_API_KEY`, plus `~/.codex/config.toml` for the current provider `base_url`
+- Primary relay config: `~/.codex/config.toml` current provider for `base_url` and `experimental_bearer_token`; `~/.codex/auth.json` is used only if the provider has no usable API key
+- Primary `base_url` is normalized for GPT Image 2 calls: if it does not end in `/v1`, the wrapper appends `/v1`
 - Fallback relay config: `~/.codex/gpt-image-2-relay-auth.json`, or a named profile file, used only after the primary GPT Image 2 API call fails
 - Missing fallback auth files are created as local empty templates when `--init-auth` is used, or after a failed primary API call when fallback is needed
-- API key fields: `OPENAI_API_KEY` or `api_key`
+- Primary provider API key fields: `experimental_bearer_token`, `OPENAI_API_KEY`, `api_key`, or `bearer_token`
+- JSON auth API key fields: `OPENAI_API_KEY` or `api_key`
 - Relay base URL fields: `OPENAI_BASE_URL`, `base_url`, `BASE_URL`, or `url`
 - Named profile files: `~/.codex/gpt-image-2-relay-auth-<profile>.json`
 - Wrapper script: `scripts/generate.py`
@@ -25,14 +27,14 @@ Never print, echo, persist, or place API keys in command arguments. The wrapper 
 
 ## Relay Config
 
-Primary config is tried first:
+Primary config is tried first. The wrapper reads the selected provider from `~/.codex/config.toml`, uses that provider's `experimental_bearer_token` when present, and normalizes the provider `base_url` to an OpenAI-compatible `/v1` root for GPT Image 2:
 
 ```text
 ~/.codex/auth.json
 ~/.codex/config.toml
 ```
 
-Fallback config is tried only after the primary GPT Image 2 API call fails. If the file is missing when fallback is needed, the wrapper creates a local template at:
+Fallback config is tried only after the primary GPT Image 2 API call fails. Explicit fallback base URLs are passed through as written; if a fallback profile omits a base URL, it reuses the normalized primary base URL. If the file is missing when fallback is needed, the wrapper creates a local template at:
 
 ```text
 ~/.codex/gpt-image-2-relay-auth.json
@@ -129,7 +131,7 @@ The wrapper automatically:
 
 - Creates `$PWD/outputs` and `$PWD/work/.venv` when needed.
 - Installs the `openai` Python package into `$PWD/work/.venv` when missing.
-- Reads the relay key and base URL from the configured environment/files.
+- Reads the primary relay key and base URL from the current Codex provider in `~/.codex/config.toml`, then falls back to `~/.codex/auth.json` for the primary key only when needed.
 - Calls the bundled imagegen CLI with `--model gpt-image-2`.
 - Avoids overwriting existing output files unless `--force` is passed.
 

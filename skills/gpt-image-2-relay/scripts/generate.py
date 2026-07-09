@@ -24,6 +24,7 @@ DEFAULT_CONFIG_TOML = Path.home() / ".codex" / "config.toml"
 DEFAULT_MODEL = "gpt-image-2"
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
 BASE_URL_KEYS = ("OPENAI_BASE_URL", "base_url", "BASE_URL", "url")
+PROVIDER_API_KEY_KEYS = ("experimental_bearer_token", "OPENAI_API_KEY", "api_key", "bearer_token")
 AUTH_TEMPLATE_INSTRUCTIONS = (
     "Fill OPENAI_API_KEY. Fill OPENAI_BASE_URL if this fallback should use a "
     "different relay; leave it empty to reuse ~/.codex/config.toml. Keep this "
@@ -134,6 +135,14 @@ def base_url_from_config(config: dict[str, Any]) -> str | None:
     return None
 
 
+def api_key_from_provider_table(table: dict[str, Any]) -> str | None:
+    for key in PROVIDER_API_KEY_KEYS:
+        value = table.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def resolve_relay_auth_config(
     image_auth_path: Path,
     profile: str | None,
@@ -219,7 +228,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
     return root
 
 
-def read_base_url(path: Path, provider: str | None) -> str:
+def read_provider_table(path: Path, provider: str | None) -> tuple[str, dict[str, Any]]:
     try:
         data = _load_toml(path)
     except FileNotFoundError:
@@ -230,11 +239,26 @@ def read_base_url(path: Path, provider: str | None) -> str:
     if isinstance(providers, dict):
         table = providers.get(str(selected))
         if isinstance(table, dict):
-            value = table.get("base_url")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+            return str(selected), table
 
+    fail(f"model provider {selected!r} missing in {path}")
+
+
+def read_base_url(path: Path, provider: str | None) -> str:
+    selected, table = read_provider_table(path, provider)
+    value = table.get("base_url")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     fail(f"base_url missing for model provider {selected!r} in {path}")
+
+
+def normalize_openai_base_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not value:
+        fail("base_url is empty")
+    if value.endswith("/v1"):
+        return value
+    return f"{value}/v1"
 
 
 def ensure_runtime(workspace: Path, requested_python: str | None, skip_install: bool) -> Path:
@@ -479,10 +503,15 @@ def main() -> int:
         print("Fill OPENAI_API_KEY and OPENAI_BASE_URL in that local file. Do not commit it.")
         return 0
 
-    primary_config = read_json_object(auth_path, required=True)
+    primary_config = read_json_object(auth_path)
+    provider_name, provider_table = read_provider_table(config_path, args.provider)
 
-    api_key = resolve_api_key(primary_config, allow_env=True, source=str(auth_path))
-    base_url = os.environ.get("OPENAI_BASE_URL") or read_base_url(config_path, args.provider)
+    api_key = api_key_from_provider_table(provider_table) or resolve_api_key(
+        primary_config,
+        allow_env=False,
+        source=f"{config_path} model_providers.{provider_name} or {auth_path}",
+    )
+    base_url = normalize_openai_base_url(read_base_url(config_path, args.provider))
 
     python_path = ensure_runtime(workspace, args.python, args.skip_install)
     cli_path = Path(args.image_cli).expanduser()
@@ -512,11 +541,7 @@ def main() -> int:
             allow_env=False,
             source=fallback_source or str(image_auth_path),
         )
-        fallback_base_url = (
-            base_url_from_config(fallback_config)
-            or os.environ.get("OPENAI_BASE_URL")
-            or read_base_url(config_path, args.provider)
-        )
+        fallback_base_url = base_url_from_config(fallback_config) or base_url
         if fallback_api_key == api_key and fallback_base_url == base_url:
             print(
                 "Primary GPT Image 2 call failed; fallback relay config matches the primary config, so no retry was attempted.",

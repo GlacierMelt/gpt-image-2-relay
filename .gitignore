@@ -1,5 +1,8 @@
 gpt-image-2-relay*.json
 *.env
 .env*
+outputs/
+work/
+.DS_Store
 __pycache__/
 *.py[cod]
