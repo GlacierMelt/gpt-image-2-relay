@@ -111,7 +111,6 @@ class RelayDriverTests(unittest.TestCase):
             )
 
             result = run_cli(
-                "--use-profile",
                 "--image-auth-json",
                 str(auth),
                 "--workspace",
@@ -154,7 +153,6 @@ class RelayDriverTests(unittest.TestCase):
             )
 
             result = run_cli(
-                "--use-profile",
                 "--image-auth-json",
                 str(auth),
                 "--workspace",
@@ -193,7 +191,6 @@ class RelayDriverTests(unittest.TestCase):
             )
 
             result = run_cli(
-                "--use-profile",
                 "--image-auth-json",
                 str(auth),
                 "--workspace",
@@ -218,12 +215,14 @@ class RelayDriverTests(unittest.TestCase):
     def test_standard_model_keeps_imagegen_driver(self):
         with tempfile.TemporaryDirectory() as temp_value:
             temp = Path(temp_value)
-            config = temp / "config.toml"
-            config.write_text(
-                'model_provider = "test"\n'
-                '[model_providers.test]\n'
-                'base_url = "http://127.0.0.1:9/v1"\n'
-                'experimental_bearer_token = "test-key"\n'
+            auth = temp / "relay.json"
+            auth.write_text(
+                json.dumps(
+                    {
+                        "OPENAI_API_KEY": "test-key",
+                        "OPENAI_BASE_URL": "http://127.0.0.1:9/v1",
+                    }
+                )
             )
             fake_cli = temp / "fake_imagegen.py"
             fake_cli.write_text(
@@ -232,10 +231,8 @@ class RelayDriverTests(unittest.TestCase):
             )
 
             result = run_cli(
-                "--config-toml",
-                str(config),
-                "--auth-json",
-                str(temp / "unused-auth.json"),
+                "--image-auth-json",
+                str(auth),
                 "--workspace",
                 str(temp),
                 "--python",
@@ -269,7 +266,6 @@ class RelayDriverTests(unittest.TestCase):
             )
 
             result = run_cli(
-                "--use-profile",
                 "--image-auth-json",
                 str(auth),
                 "--workspace",
@@ -284,65 +280,6 @@ class RelayDriverTests(unittest.TestCase):
             self.assertIn("relay driver: openai-images", result.stdout)
             self.assertIn('"model": "gpt-image-2-4K 高质量线路"', result.stdout)
             self.assertIn('"size": "21:9"', result.stdout)
-
-    def test_fallback_can_switch_driver_and_model(self):
-        with tempfile.TemporaryDirectory() as temp_value, LocalRelay() as relay:
-            temp = Path(temp_value)
-            config = temp / "config.toml"
-            config.write_text(
-                'model_provider = "test"\n'
-                '[model_providers.test]\n'
-                'base_url = "http://127.0.0.1:9/v1"\n'
-                'experimental_bearer_token = "primary-key"\n'
-            )
-            fallback = temp / "fallback.json"
-            fallback.write_text(
-                json.dumps(
-                    {
-                        "OPENAI_API_KEY": "fallback-key",
-                        "OPENAI_BASE_URL": relay.base_url,
-                        "driver": "openai-images",
-                        "model": "特惠image2",
-                        "size": "3:2",
-                        "response_format": "b64_json",
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            failing_cli = temp / "failing_imagegen.py"
-            failing_cli.write_text(
-                "import sys\n"
-                "print('Calling Image API', file=sys.stderr)\n"
-                "raise SystemExit(1)\n"
-            )
-
-            result = run_cli(
-                "--config-toml",
-                str(config),
-                "--auth-json",
-                str(temp / "unused-auth.json"),
-                "--image-auth-json",
-                str(fallback),
-                "--workspace",
-                str(temp),
-                "--python",
-                sys.executable,
-                "--image-cli",
-                str(failing_cli),
-                "--prompt",
-                "fallback prompt",
-                "--no-augment",
-                "--filename",
-                "fallback.png",
-                cwd=temp,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((temp / "outputs" / "fallback.png").read_bytes(), PNG_BYTES)
-            payload = json.loads(relay.server.requests[0]["body"])
-            self.assertEqual(payload["model"], "特惠image2")
-            self.assertIn("retrying with fallback relay config", result.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()

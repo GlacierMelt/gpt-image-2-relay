@@ -1,20 +1,16 @@
 # GPT Image Relay Skill
 
-Codex skill for generating and editing images through configurable OpenAI-compatible relay drivers. It supports standard GPT Image models and arbitrary relay model IDs, including custom or Chinese aliases.
-
-The skill uses Codex's bundled image helper for known system models and a direct `/images/generations` or `/images/edits` driver for relay-specific models. It reads credentials from local Codex config files and keeps API keys out of shell history and command arguments.
+Codex skill for generating and editing images through configurable OpenAI-compatible relay APIs. It supports standard GPT Image models, arbitrary relay model IDs, direct image generations and edits, and concurrent multi-API prompt distribution.
 
 ## What It Does
 
-- Selects `imagegen` or `openai-images` per relay request.
-- Passes arbitrary `model`, `size`, and `quality` values to direct relays unchanged.
-- Handles URL and Base64 image responses, plus multipart image edits.
-- Reads the primary relay from the current provider in `~/.codex/config.toml`.
-- Supports provider keys from `experimental_bearer_token`, `OPENAI_API_KEY`, `api_key`, or `bearer_token`.
-- Normalizes the primary provider `base_url` to an OpenAI-compatible `/v1` endpoint.
-- Falls back to local profile files such as `~/.codex/gpt-image-2-relay-auth-work.json` if the primary call fails, or uses one directly with `--use-profile`.
-- Writes generated assets to the current workspace's `outputs/` directory by default.
-- Creates and uses a workspace-local Python virtual environment at `work/.venv`.
+- Selects `imagegen` for known system models and `openai-images` for custom relay models.
+- Passes exact relay `model`, `size`, and `quality` values through unchanged.
+- Handles URL and Base64 image responses and multipart image edits.
+- Reads relay credentials only from `~/.codex/gpt-image-2-relay-auth.json`.
+- Keeps the top-level fields as the default single API and uses inline `profiles` only when explicitly selected.
+- Distributes repeated prompts across selected profiles without broadcasting one prompt to every API.
+- Writes generated assets to the current workspace's `outputs/` directory.
 
 ## Install
 
@@ -25,69 +21,26 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
   --url https://github.com/GlacierMelt/gpt-image-2-relay/tree/main/skills/gpt-image-2-relay
 ```
 
-Restart Codex after installation so the skill is loaded.
+Restart Codex after installation so the skill is loaded. To update later, run the same command again.
 
-You can also install with explicit repo/path arguments:
+## Configure
 
-```bash
-python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo GlacierMelt/gpt-image-2-relay \
-  --path skills/gpt-image-2-relay
-```
-
-To update later, rerun the same install command and restart Codex.
-
-## Configure Primary Relay
-
-The wrapper first uses the selected provider in `~/.codex/config.toml`:
-
-```toml
-model_provider = "my-relay"
-
-[model_providers.my-relay]
-base_url = "https://your-relay.example"
-experimental_bearer_token = "YOUR_RELAY_API_KEY"
-image_driver = "openai-images"
-image_model = "YOUR_EXACT_RELAY_MODEL_ID"
-image_size = "YOUR_RELAY_SIZE"
-image_quality = "high"
-image_response_format = "url"
-image_output_format = "png"
-```
-
-The `image_` fields are optional and do not change the provider's chat-model settings. Explicit CLI options override these fields. If the primary `base_url` does not end in `/v1`, the wrapper appends `/v1`.
-
-If the selected provider has no usable API key field, the wrapper falls back to `~/.codex/auth.json` for the primary key:
-
-```json
-{
-  "OPENAI_API_KEY": "YOUR_RELAY_API_KEY"
-}
-```
-
-Do not put real credentials in this repository. Keep filled config and auth files under `~/.codex`.
-
-## Relay Profiles
-
-Profiles are tried after the primary image call fails by default. Add `--use-profile` to skip the primary provider and use a profile directly.
-
-Create a local fallback template:
-
-```bash
-python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py --init-auth
-```
-
-That creates:
+The only configuration file is:
 
 ```text
 ~/.codex/gpt-image-2-relay-auth.json
 ```
 
-Fill it locally:
+Create an empty template without making an API call:
+
+```bash
+python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py --init-auth
+```
+
+Fill the top-level default API and any profiles locally:
 
 ```json
 {
-  "_instructions": "Fill relay credentials and optional image settings. Keep this file in ~/.codex and do not commit it.",
   "OPENAI_API_KEY": "",
   "OPENAI_BASE_URL": "",
   "driver": "openai-images",
@@ -95,56 +48,17 @@ Fill it locally:
   "size": "YOUR_RELAY_SIZE",
   "quality": "high",
   "response_format": "url",
-  "output_format": "png"
-}
-```
-
-The wrapper treats model IDs and size values as opaque relay strings. IDs such as `特惠image2` and `gpt-image-2-4K 高质量线路`, plus sizes such as `3:2` and `21:9`, require no code changes.
-
-Create a named fallback profile:
-
-```bash
-python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py --init-auth --profile work
-```
-
-That creates:
-
-```text
-~/.codex/gpt-image-2-relay-auth-work.json
-```
-
-Use the profile:
-
-```bash
-python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
-  --profile work \
-  --prompt "A red apple on a white background, realistic product photography" \
-  --filename apple.png
-```
-
-Use it directly without calling the primary provider first:
-
-```bash
-python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
-  --use-profile \
-  --profile work \
-  --prompt "A red apple on a white background, realistic product photography" \
-  --filename apple.png
-```
-
-You can also keep multiple fallback profiles inside `~/.codex/gpt-image-2-relay-auth.json`:
-
-```json
-{
+  "output_format": "png",
   "profiles": {
-    "work": {
+    "relay_1": {
       "OPENAI_API_KEY": "",
-      "OPENAI_BASE_URL": "",
-      "driver": "openai-images",
-      "model": "YOUR_EXACT_RELAY_MODEL_ID",
-      "size": "3:2"
+      "OPENAI_BASE_URL": ""
     },
-    "personal": {
+    "relay_2": {
+      "OPENAI_API_KEY": "",
+      "OPENAI_BASE_URL": ""
+    },
+    "relay_3": {
       "OPENAI_API_KEY": "",
       "OPENAI_BASE_URL": ""
     }
@@ -152,86 +66,72 @@ You can also keep multiple fallback profiles inside `~/.codex/gpt-image-2-relay-
 }
 ```
 
-## Use
+Each profile normally needs only `OPENAI_API_KEY` and `OPENAI_BASE_URL`. Keep this file outside the repository and never commit it. The wrapper does not read `~/.codex/config.toml`, `~/.codex/auth.json`, or API-key environment variables.
 
-Generate an image:
+Model IDs and size values are opaque relay values. Custom values such as `特惠image2`, `gpt-image-2-4K 高质量线路`, `3:2`, and `21:9` require no code changes.
+
+## Single API
+
+Omit profile selectors to use the top-level default API:
 
 ```bash
 python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
   --prompt "A red apple on a white background, realistic product photography" \
   --filename apple.png \
-  --size 1024x1024 \
   --quality low
 ```
 
-Generate with an arbitrary relay model ID and relay-specific size:
+Use one named inline profile directly:
 
 ```bash
 python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
-  --use-profile \
-  --driver openai-images \
-  --model "YOUR_EXACT_RELAY_MODEL_ID" \
-  --size "YOUR_RELAY_SIZE" \
+  --profile relay_1 \
   --prompt "A cinematic product photograph" \
   --filename product.png
 ```
 
-Edit or upscale an existing image:
+## Multiple Prompts and APIs
+
+Repeat `--prompt` or `--prompt-file` in the intended order. Each prompt is sent exactly once and assigned round-robin to the selected profiles.
+
+```bash
+python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
+  --profiles relay_1,relay_2,relay_3 \
+  --prompt "A rainy Tokyo alley at night" \
+  --prompt "A transparent keycap containing a miniature greenhouse" \
+  --prompt "A Mars base at sunrise" \
+  --filename batch.png
+```
+
+The assignment is `prompt 1 -> relay_1`, `prompt 2 -> relay_2`, and `prompt 3 -> relay_3`. With five prompts and two profiles, the assignment is `1 -> relay_1`, `2 -> relay_2`, `3 -> relay_1`, `4 -> relay_2`, `5 -> relay_1`.
+
+Different profile queues run concurrently. Multiple prompts assigned to the same profile run sequentially in input order. If there are fewer prompts than selected profiles, unused profiles are not called. One prompt is sent only to the first selected profile; it is never broadcast automatically.
+
+When multiple prompts are supplied, outputs include both the prompt index and profile, for example `batch--p001--relay-1.png`. `--n` controls images per prompt task and defaults to `1`; it does not change prompt assignment.
+
+Use `--profile-count N` to select the first N configured profiles, or `--profiles all` only when every configured profile is wanted. Multi-profile runs require at least two selected profiles and do not call the top-level default API.
+
+## Edit or Upscale
 
 ```bash
 python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
   --image input.png \
-  --prompt "Increase the image resolution and clarity while preserving the same subject, composition, colors, identity, and background. Do not add new objects or text." \
+  --prompt "Increase resolution and clarity while preserving the subject, composition, colors, identity, and background." \
   --filename enhanced.png \
   --size 2048x2048 \
   --quality high
 ```
 
-Check command construction without calling the API:
-
-```bash
-python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
-  --prompt "Smoke test image" \
-  --filename smoke.png \
-  --quality low \
-  --dry-run
-```
-
-## Useful Options
-
-- `--prompt` or `--prompt-file`: generation/edit instruction.
-- `--image`: input image path for edits; repeat for multi-image edits.
-- `--mask`: optional mask path for the first input image.
-- `--filename`: filename under the workspace `outputs/` directory.
-- `--out`: exact output path.
-- `--driver`: `auto`, `imagegen`, or `openai-images`.
-- `--model`: exact relay model ID.
-- `--size`: exact pixel size, ratio, or relay-specific size value.
-- `--quality`: exact relay quality value.
-- `--response-format`: `url` or `b64_json` for the direct driver.
-- `--background`, `--upscale`, `--output-format`, `--output-compression`, `--moderation`: optional relay fields.
-- `--extra-json`: forward-compatible JSON fields for direct requests.
-- `--profile`: named fallback profile.
-- `--use-profile`: use the selected profile directly.
-- `--force`: replace an existing output path.
-
-## Test
+## Validation
 
 Run the local relay simulation suite without credentials or paid API calls:
 
 ```bash
-python -m unittest -v tests/test_generate.py
+python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-## Troubleshooting
+Run a no-call command construction check with `--dry-run`.
 
-- `model_not_found`: the selected relay does not expose the exact configured model ID.
-- `AuthenticationError`: check the selected provider token in `~/.codex/config.toml` or the local fallback profile.
-- `base_url missing`: set `base_url` in the selected provider table in `~/.codex/config.toml`.
-- `imagegen CLI not found`: make sure Codex's bundled system skills are installed at `~/.codex/skills/.system/imagegen`.
-- `openai package is missing`: rerun without `--skip-install` so the wrapper can install it into `work/.venv`.
-- `relay response did not contain url or b64_json`: the selected endpoint uses an unsupported response shape.
+## Security
 
-## Security Notes
-
-Never commit API keys, relay credentials, `~/.codex/gpt-image-2-relay-auth*.json`, `.env` files, generated `outputs/`, or workspace `work/` directories. The wrapper passes keys to the standard driver through environment variables, keeps direct-driver credentials in process memory, and redacts key-like strings from errors.
+Never commit API keys, relay credentials, `~/.codex/gpt-image-2-relay-auth*.json`, `.env` files, generated `outputs/`, or workspace `work/` directories. The wrapper passes keys to child processes without putting them in command arguments and redacts key-like values from errors.

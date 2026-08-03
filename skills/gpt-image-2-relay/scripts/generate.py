@@ -17,7 +17,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -26,9 +28,7 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
-DEFAULT_AUTH_JSON = Path.home() / ".codex" / "auth.json"
 DEFAULT_IMAGE_AUTH_JSON = Path.home() / ".codex" / "gpt-image-2-relay-auth.json"
-DEFAULT_CONFIG_TOML = Path.home() / ".codex" / "config.toml"
 DEFAULT_MODEL = "gpt-image-2"
 DEFAULT_DRIVER = "auto"
 DEFAULT_SIZE = "1024x1024"
@@ -43,7 +43,7 @@ KNOWN_IMAGEGEN_MODELS = {
 }
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
 BASE_URL_KEYS = ("OPENAI_BASE_URL", "base_url", "BASE_URL", "url")
-PROVIDER_API_KEY_KEYS = ("experimental_bearer_token", "OPENAI_API_KEY", "api_key", "bearer_token")
+JSON_API_KEY_KEYS = ("OPENAI_API_KEY", "api_key")
 IMAGE_RESPONSE_KEYS = {"url", "b64_json", "b64Json"}
 DRIVER_ALIASES = {
     "auto": "auto",
@@ -54,24 +54,10 @@ DRIVER_ALIASES = {
     "direct": "openai-images",
     "relay": "openai-images",
 }
-PROVIDER_IMAGE_OPTIONS = {
-    "driver": "image_driver",
-    "model": "image_model",
-    "size": "image_size",
-    "quality": "image_quality",
-    "response_format": "image_response_format",
-    "output_format": "image_output_format",
-    "style": "image_style",
-    "background": "image_background",
-    "upscale": "image_upscale",
-    "request_timeout": "image_request_timeout",
-    "extra_json": "image_extra_json",
-}
 AUTH_TEMPLATE_INSTRUCTIONS = (
-    "Fill OPENAI_API_KEY and OPENAI_BASE_URL. Optionally set driver, model, size, "
-    "quality, response_format, and output_format for this relay. Leave "
-    "OPENAI_BASE_URL empty to reuse ~/.codex/config.toml. Keep this file in "
-    "~/.codex and do not commit it."
+    "This is the only relay config file. The top-level relay is the default "
+    "single API; inline profiles are used only when explicitly selected. Keep "
+    "this file in ~/.codex and do not commit it."
 )
 
 
@@ -80,11 +66,45 @@ class DriverResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
-    attempted: bool = False
+    outputs: tuple[str, ...] = ()
+
+
+@dataclass
+class ProfileAttempt:
+    prompt_index: int
+    name: str
+    args: argparse.Namespace
+    api_key: str
+    base_url: str
+    out: Path
+
+
+@dataclass
+class ProfileAttemptResult:
+    prompt_index: int
+    name: str
+    result: DriverResult
+    elapsed_seconds: float
 
 
 class RelayRequestError(RuntimeError):
     """Readable HTTP, response, or download error from a direct relay."""
+
+
+class OrderedPromptAction(argparse.Action):
+    """Keep prompt and prompt-file options in their original CLI order."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        ordered = list(getattr(namespace, "prompt_inputs", None) or [])
+        ordered.append((self.dest, values))
+        namespace.prompt_inputs = ordered
+        setattr(namespace, self.dest, values)
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -96,19 +116,6 @@ def sanitize(text: str, api_key: str | None = None) -> str:
     if api_key:
         text = text.replace(api_key, "sk-<redacted>")
     return KEY_RE.sub("sk-<redacted>", text)
-
-
-def read_api_key(path: Path) -> str:
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        fail(f"auth file not found: {path}")
-    except json.JSONDecodeError as exc:
-        fail(f"auth file is not valid JSON: {path}: {exc}")
-    value = data.get("OPENAI_API_KEY")
-    if not isinstance(value, str) or not value.strip():
-        fail(f"OPENAI_API_KEY missing in {path}")
-    return value.strip()
 
 
 def read_json_object(path: Path, required: bool = False) -> dict[str, Any]:
@@ -125,8 +132,9 @@ def read_json_object(path: Path, required: bool = False) -> dict[str, Any]:
     return data
 
 
-def profile_file(base_path: Path, profile: str) -> Path:
-    return base_path.with_name(f"{base_path.stem}-{profile}{base_path.suffix}")
+def shared_inline_profile_config(data: dict[str, Any]) -> dict[str, Any]:
+    excluded = {"_instructions", "profiles", *JSON_API_KEY_KEYS, *BASE_URL_KEYS}
+    return {key: value for key, value in data.items() if key not in excluded}
 
 
 def extract_profile(data: dict[str, Any], profile: str, source: Path) -> dict[str, Any]:
@@ -138,7 +146,7 @@ def extract_profile(data: dict[str, Any], profile: str, source: Path) -> dict[st
         return {}
     if not isinstance(value, dict):
         fail(f"profile {profile!r} in {source} must be a JSON object")
-    return value
+    return {**shared_inline_profile_config(data), **value}
 
 
 def write_auth_template(path: Path) -> bool:
@@ -156,6 +164,13 @@ def write_auth_template(path: Path) -> bool:
         "response_format": "",
         "output_format": "",
     }
+    template["profiles"] = {
+        f"relay_{index}": {
+            "OPENAI_API_KEY": "",
+            "OPENAI_BASE_URL": "",
+        }
+        for index in range(1, 4)
+    }
     path.write_text(json.dumps(template, indent=2) + "\n")
     try:
         path.chmod(0o600)
@@ -164,22 +179,18 @@ def write_auth_template(path: Path) -> bool:
     return True
 
 
-def fail_with_auth_template(path: Path, reason: str, profile: str | None = None) -> None:
+def fail_with_auth_template(path: Path, reason: str) -> None:
     created = write_auth_template(path)
-    target = f"fallback relay profile {profile!r}" if profile else "fallback relay config"
     action = "Created" if created else "Use"
     fail(
-        f"{reason}. {action} {target} template at {path}. "
+        f"{reason}. {action} relay auth template at {path}. "
         "Fill OPENAI_API_KEY and OPENAI_BASE_URL with your relay key/base URL, then rerun. "
         "Keep this file outside the GitHub repo; do not commit private credentials."
     )
 
 
-def resolve_api_key(config: dict[str, Any], allow_env: bool = True, source: str = "selected relay config") -> str:
-    env_key = os.environ.get("OPENAI_API_KEY") if allow_env else None
-    if env_key:
-        return env_key.strip()
-    value = config.get("OPENAI_API_KEY") or config.get("api_key")
+def resolve_api_key(config: dict[str, Any], source: str = "selected relay config") -> str:
+    value = next((config.get(key) for key in JSON_API_KEY_KEYS if config.get(key)), None)
     if not isinstance(value, str) or not value.strip():
         fail(
             f"OPENAI_API_KEY missing in {source}. "
@@ -196,12 +207,79 @@ def base_url_from_config(config: dict[str, Any]) -> str | None:
     return None
 
 
-def api_key_from_provider_table(table: dict[str, Any]) -> str | None:
-    for key in PROVIDER_API_KEY_KEYS:
-        value = table.get(key)
+def api_key_from_config(config: dict[str, Any]) -> str | None:
+    for key in JSON_API_KEY_KEYS:
+        value = config.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def split_profile_selectors(values: list[str]) -> list[str]:
+    selected: list[str] = []
+    for value in values:
+        for part in value.split(","):
+            name = part.strip()
+            if name and name not in selected:
+                selected.append(name)
+    if not selected:
+        fail("profiles must contain at least two profile names, or 'all'")
+    if "all" in selected and selected != ["all"]:
+        fail("profiles value 'all' cannot be combined with named profiles")
+    return selected
+
+
+def select_inline_profiles(
+    data: dict[str, Any],
+    source: Path,
+    selectors: list[str] | None,
+    profile_count: int | None,
+) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+    raw_profiles = data.get("profiles")
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        fail(f"profiles must be a non-empty JSON object in {source}")
+
+    shared = shared_inline_profile_config(data)
+    profiles: dict[str, dict[str, Any]] = {}
+    for name, value in raw_profiles.items():
+        if not isinstance(value, dict):
+            fail(f"profile {name!r} in {source} must be a JSON object")
+        profiles[str(name)] = {**shared, **value}
+
+    configured = [
+        name
+        for name, config in profiles.items()
+        if api_key_from_config(config) and base_url_from_config(config)
+    ]
+    skipped = [name for name in profiles if name not in configured]
+
+    if profile_count is not None:
+        if profile_count < 2:
+            fail("profile-count must be at least 2; use --profile for a single profile")
+        if len(configured) < profile_count:
+            fail(
+                f"profile-count requested {profile_count}, but only {len(configured)} "
+                f"profiles have both OPENAI_API_KEY and OPENAI_BASE_URL in {source}"
+            )
+        names = configured[:profile_count]
+    else:
+        names = split_profile_selectors(selectors or [])
+        if names == ["all"]:
+            names = configured
+        else:
+            missing = [name for name in names if name not in profiles]
+            if missing:
+                fail(f"profiles not found in {source}: {', '.join(missing)}")
+            incomplete = [name for name in names if name not in configured]
+            if incomplete:
+                fail(
+                    "selected profiles must contain both OPENAI_API_KEY and OPENAI_BASE_URL: "
+                    + ", ".join(incomplete)
+                )
+
+    if len(names) < 2:
+        fail("multi-API generation requires at least two configured profiles")
+    return [(name, profiles[name]) for name in names], skipped
 
 
 def resolve_relay_auth_config(
@@ -209,118 +287,20 @@ def resolve_relay_auth_config(
     profile: str | None,
     create_missing: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
+    if not image_auth_path.exists():
+        if create_missing:
+            fail_with_auth_template(image_auth_path, "relay auth config not found")
+        return {}, None
+
+    data = read_json_object(image_auth_path, required=True)
     if profile:
-        selected_profile_path = profile_file(image_auth_path, profile)
-        if selected_profile_path.exists():
-            return read_json_object(selected_profile_path, required=True), str(selected_profile_path)
-        default_data = read_json_object(image_auth_path)
-        inline_profile = extract_profile(default_data, profile, image_auth_path)
+        inline_profile = extract_profile(data, profile, image_auth_path)
         if inline_profile:
             return inline_profile, f"{image_auth_path} profiles.{profile}"
         if create_missing:
-            fail_with_auth_template(
-                selected_profile_path,
-                f"profile {profile!r} not found. Expected {selected_profile_path} "
-                f"or profiles.{profile} in {image_auth_path}",
-                profile=profile,
-            )
+            fail(f"profile {profile!r} not found in {image_auth_path} profiles")
         return {}, None
-    if image_auth_path.exists():
-        return read_json_object(image_auth_path, required=True), str(image_auth_path)
-    if create_missing:
-        fail_with_auth_template(image_auth_path, "fallback relay config not found")
-    return {}, None
-
-
-def _parse_scalar(value: str) -> Any:
-    value = value.strip()
-    if not value:
-        return ""
-    if value[0] in {"'", '"'}:
-        quote = value[0]
-        out = []
-        escaped = False
-        for ch in value[1:]:
-            if escaped:
-                out.append(ch)
-                escaped = False
-            elif ch == "\\" and quote == '"':
-                escaped = True
-            elif ch == quote:
-                return "".join(out)
-            else:
-                out.append(ch)
-        return "".join(out)
-    if "#" in value:
-        value = value.split("#", 1)[0].strip()
-    if value.lower() == "true":
-        return True
-    if value.lower() == "false":
-        return False
-    return value
-
-
-def _load_toml(path: Path) -> dict[str, Any]:
-    text = path.read_text(errors="replace")
-    try:
-        import tomllib  # type: ignore
-
-        return tomllib.loads(text)
-    except ModuleNotFoundError:
-        pass
-    except Exception:
-        pass
-
-    root: dict[str, Any] = {}
-    current: dict[str, Any] = root
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            current = root
-            for part in line[1:-1].split("."):
-                part = part.strip().strip('"').strip("'")
-                current = current.setdefault(part, {})
-            continue
-        match = re.match(r"^([A-Za-z0-9_.-]+)\s*=\s*(.+)$", line)
-        if match:
-            current[match.group(1)] = _parse_scalar(match.group(2))
-    return root
-
-
-def read_provider_table(path: Path, provider: str | None) -> tuple[str, dict[str, Any]]:
-    try:
-        data = _load_toml(path)
-    except FileNotFoundError:
-        fail(f"config file not found: {path}")
-
-    selected = provider or data.get("model_provider") or "custom"
-    providers = data.get("model_providers")
-    if isinstance(providers, dict):
-        table = providers.get(str(selected))
-        if isinstance(table, dict):
-            return str(selected), table
-
-    fail(f"model provider {selected!r} missing in {path}")
-
-
-def read_base_url(path: Path, provider: str | None) -> str:
-    selected, table = read_provider_table(path, provider)
-    value = table.get("base_url")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-
-    fail(f"base_url missing for model provider {selected!r} in {path}")
-
-
-def normalize_openai_base_url(value: str) -> str:
-    value = value.strip().rstrip("/")
-    if not value:
-        fail("base_url is empty")
-    if value.endswith("/v1"):
-        return value
-    return f"{value}/v1"
+    return data, str(image_auth_path)
 
 
 def safe_base_url(value: str) -> str:
@@ -344,14 +324,6 @@ def validate_http_base_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise RelayRequestError(f"invalid relay base URL: {safe_base_url(value)!r}")
     return value
-
-
-def provider_image_config(table: dict[str, Any]) -> dict[str, Any]:
-    return {
-        option: table[field]
-        for option, field in PROVIDER_IMAGE_OPTIONS.items()
-        if field in table
-    }
 
 
 def nonempty_config_value(config: dict[str, Any], key: str) -> Any:
@@ -469,10 +441,9 @@ def unique_path(path: Path) -> Path:
     fail(f"could not find an unused filename near {path}")
 
 
-def choose_output(args: argparse.Namespace, workspace: Path) -> Path:
+def output_candidate(args: argparse.Namespace, workspace: Path) -> Path:
     output_dir = Path(args.output_dir).expanduser() if args.output_dir else workspace / "outputs"
     output_dir = output_dir if output_dir.is_absolute() else workspace / output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.out:
         out = Path(args.out).expanduser()
@@ -484,10 +455,40 @@ def choose_output(args: argparse.Namespace, workspace: Path) -> Path:
         ext = args.output_format or "png"
         out = output_dir / f"{slugify(prompt)}.{ext}"
 
+    return out
+
+
+def choose_output(args: argparse.Namespace, workspace: Path) -> Path:
+    out = output_candidate(args, workspace)
+
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists() and not args.force:
         out = unique_path(out)
     return out
+
+
+def choose_profile_output(
+    args: argparse.Namespace,
+    workspace: Path,
+    profile: str,
+    prompt_index: int,
+    prompt_count: int,
+    reserved: set[Path],
+) -> Path:
+    base = output_candidate(args, workspace)
+    token = slugify(profile)
+    if prompt_count > 1:
+        root = base.with_name(f"{base.stem}--p{prompt_index:03d}--{token}{base.suffix}")
+    else:
+        root = base.with_name(f"{base.stem}--{token}{base.suffix}")
+    candidate = root
+    index = 2
+    while candidate in reserved or (candidate.exists() and not args.force):
+        candidate = root.with_name(f"{root.stem}-{index}{root.suffix}")
+        index += 1
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    reserved.add(candidate)
+    return candidate
 
 
 def add_optional(cmd: list[str], flag: str, value: Any) -> None:
@@ -519,6 +520,27 @@ def read_prompt_text(args: argparse.Namespace, workspace: Path) -> str:
     if not prompt:
         fail("prompt must not be empty")
     return prompt
+
+
+def expand_prompt_args(args: argparse.Namespace, workspace: Path) -> list[argparse.Namespace]:
+    ordered = list(getattr(args, "prompt_inputs", None) or [])
+    if not ordered:
+        if args.prompt is not None:
+            ordered.append(("prompt", args.prompt))
+        elif args.prompt_file:
+            ordered.append(("prompt_file", args.prompt_file))
+        else:
+            fail("provide --prompt or --prompt-file")
+
+    expanded: list[argparse.Namespace] = []
+    for kind, value in ordered:
+        prompt_args = argparse.Namespace(**vars(args))
+        prompt_args.prompt = None
+        prompt_args.prompt_file = None
+        setattr(prompt_args, kind, value)
+        read_prompt_text(prompt_args, workspace)
+        expanded.append(prompt_args)
+    return expanded
 
 
 def augment_prompt(args: argparse.Namespace, prompt: str) -> str:
@@ -830,7 +852,7 @@ def run_openai_images_driver(
                 preview["mask"] = resolve_existing_path(args.mask, workspace)
         print(json.dumps(preview, ensure_ascii=False, indent=2, sort_keys=True))
         print(f"Dry-run output path: {out}")
-        return DriverResult(0)
+        return DriverResult(0, outputs=(str(out),))
 
     try:
         if command == "generate":
@@ -866,11 +888,15 @@ def run_openai_images_driver(
         )
     except RelayRequestError as exc:
         message = sanitize(str(exc), api_key)
-        return DriverResult(1, stderr=f"Direct relay request failed: {message}\n", attempted=True)
+        return DriverResult(1, stderr=f"Direct relay request failed: {message}\n")
 
     for path in saved:
         print(f"Final output: {path}")
-    return DriverResult(0, stdout="\n".join(str(path) for path in saved), attempted=True)
+    return DriverResult(
+        0,
+        stdout="\n".join(str(path) for path in saved),
+        outputs=tuple(str(path) for path in saved),
+    )
 
 
 def build_command(args: argparse.Namespace, python_path: Path, cli_path: Path, out: Path, workspace: Path) -> list[str]:
@@ -961,24 +987,8 @@ def run_image_command(
         returncode=result.returncode,
         stdout=result.stdout,
         stderr=result.stderr,
-        attempted=api_call_was_attempted_output(result.stdout, result.stderr),
+        outputs=(str(out),) if result.returncode == 0 else (),
     )
-
-
-def api_call_was_attempted_output(stdout: str, stderr: str) -> bool:
-    combined = f"{stdout}\n{stderr}"
-    return (
-        "Calling Image API" in combined
-        or "Error code:" in combined
-        or "openai." in combined
-        or "AuthenticationError" in combined
-        or "APIConnectionError" in combined
-        or "APITimeoutError" in combined
-    )
-
-
-def api_call_was_attempted(result: DriverResult) -> bool:
-    return result.attempted or api_call_was_attempted_output(result.stdout, result.stderr)
 
 
 def run_relay_attempt(
@@ -1020,48 +1030,203 @@ def run_relay_attempt(
     return result
 
 
-def attempt_signature(
-    api_key: str,
-    base_url: str,
-    args: argparse.Namespace,
-) -> tuple[Any, ...]:
-    return (
-        api_key,
-        base_url.rstrip("/"),
-        args.driver,
-        args.model,
-        args.size,
-        args.quality,
-        args.response_format,
-        args.output_format,
-        args.style,
-        args.background,
-        args.upscale,
-        compact_json(args.extra_json),
+def execute_profile_attempt(attempt: ProfileAttempt, workspace: Path) -> ProfileAttemptResult:
+    started = time.monotonic()
+    try:
+        result = run_relay_attempt(
+            label=f"profile {attempt.name!r}",
+            args=attempt.args,
+            api_key=attempt.api_key,
+            base_url=attempt.base_url,
+            out=attempt.out,
+            workspace=workspace,
+        )
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) and exc.code else 1
+        result = DriverResult(code, stderr="profile attempt stopped before completion\n")
+    except Exception as exc:
+        message = sanitize(str(exc), attempt.api_key)
+        print(f"Profile {attempt.name!r} failed unexpectedly: {message}", file=sys.stderr)
+        result = DriverResult(1, stderr=f"unexpected profile failure: {message}\n")
+    return ProfileAttemptResult(
+        prompt_index=attempt.prompt_index,
+        name=attempt.name,
+        result=result,
+        elapsed_seconds=time.monotonic() - started,
     )
+
+
+def execute_profile_queue(
+    attempts: list[ProfileAttempt],
+    workspace: Path,
+) -> list[ProfileAttemptResult]:
+    return [execute_profile_attempt(attempt, workspace) for attempt in attempts]
+
+
+def run_parallel_profiles(
+    args: argparse.Namespace,
+    image_auth_path: Path,
+    workspace: Path,
+) -> int:
+    data = read_json_object(image_auth_path, required=True)
+    selected, skipped = select_inline_profiles(
+        data,
+        image_auth_path,
+        args.profiles,
+        args.profile_count,
+    )
+    if skipped:
+        print(
+            "Ignoring profiles without both OPENAI_API_KEY and OPENAI_BASE_URL: "
+            + ", ".join(skipped),
+            file=sys.stderr,
+        )
+
+    prompt_args = expand_prompt_args(args, workspace)
+    if args.mode == "edit" and not args.image:
+        fail("--mode edit requires at least one --image")
+    if args.mode == "generate" and args.image:
+        fail("--mode generate cannot be combined with --image")
+    for image in args.image or []:
+        resolve_existing_path(image, workspace)
+    if args.mask:
+        resolve_existing_path(args.mask, workspace)
+
+    reserved: set[Path] = set()
+    attempts: list[ProfileAttempt] = []
+    for prompt_index, task_args in enumerate(prompt_args, start=1):
+        name, config = selected[(prompt_index - 1) % len(selected)]
+        source = f"{image_auth_path} profiles.{name}"
+        api_key = resolve_api_key(config, source=source)
+        base_url = base_url_from_config(config)
+        if not base_url:
+            fail(f"OPENAI_BASE_URL missing in {source}")
+        try:
+            base_url = validate_http_base_url(base_url)
+        except RelayRequestError as exc:
+            fail(f"profile {name!r}: {exc}")
+        resolved_args = resolve_attempt_args(task_args, config)
+        out = choose_profile_output(
+            resolved_args,
+            workspace,
+            name,
+            prompt_index,
+            len(prompt_args),
+            reserved,
+        )
+        attempts.append(
+            ProfileAttempt(
+                prompt_index=prompt_index,
+                name=name,
+                args=resolved_args,
+                api_key=api_key,
+                base_url=base_url,
+                out=out,
+            )
+        )
+
+    direct_attempts = [attempt for attempt in attempts if attempt.args.driver == "openai-images"]
+    if direct_attempts and args.downscale_max_dim is not None:
+        fail("--downscale-max-dim is not supported by the openai-images driver")
+    if direct_attempts and args.image:
+        validate_reference_images(args.image, workspace)
+
+    imagegen_attempts = [attempt for attempt in attempts if attempt.args.driver == "imagegen"]
+    if imagegen_attempts:
+        cli_path = Path(args.image_cli).expanduser()
+        if not cli_path.exists():
+            fail(f"imagegen CLI not found: {cli_path}")
+        runtime = ensure_runtime(workspace, args.python, args.skip_install)
+        for attempt in imagegen_attempts:
+            attempt.args.python = str(runtime)
+
+    queues: dict[str, list[ProfileAttempt]] = {}
+    for attempt in attempts:
+        queues.setdefault(attempt.name, []).append(attempt)
+
+    unused = [name for name, _config in selected if name not in queues]
+    if unused:
+        print("Selected profiles without an assigned prompt: " + ", ".join(unused))
+
+    assignment = ", ".join(
+        f"p{attempt.prompt_index:03d}->{attempt.name}" for attempt in attempts
+    )
+    print(
+        f"Starting {len(attempts)} prompt task(s) across {len(queues)} relay profile(s): "
+        + assignment
+    )
+    if not args.dry_run:
+        print(
+            f"Each prompt task sends one API request with n={args.n} and may be billed."
+        )
+
+    completed: dict[int, ProfileAttemptResult] = {}
+    with ThreadPoolExecutor(max_workers=len(queues), thread_name_prefix="image-relay") as executor:
+        futures = {
+            executor.submit(execute_profile_queue, queue, workspace): name
+            for name, queue in queues.items()
+        }
+        for future in as_completed(futures):
+            for outcome in future.result():
+                completed[outcome.prompt_index] = outcome
+
+    print("Concurrent prompt summary:")
+    failed = False
+    for attempt in attempts:
+        outcome = completed[attempt.prompt_index]
+        status = "ok" if outcome.result.returncode == 0 else f"failed ({outcome.result.returncode})"
+        outputs = ", ".join(outcome.result.outputs)
+        suffix = f"; outputs: {outputs}" if outputs else ""
+        print(
+            f"- p{attempt.prompt_index:03d} -> {attempt.name}: "
+            f"{status}; {outcome.elapsed_seconds:.2f}s{suffix}"
+        )
+        failed = failed or outcome.result.returncode != 0
+    return 1 if failed else 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate or edit images through configurable relay drivers.")
     parser.add_argument("--mode", choices=["auto", "generate", "edit"], default="auto")
-    parser.add_argument("--prompt")
-    parser.add_argument("--prompt-file")
+    parser.add_argument(
+        "--prompt",
+        action=OrderedPromptAction,
+        help="Prompt text. Repeat in multi-profile mode to create ordered prompt tasks.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        action=OrderedPromptAction,
+        help="Prompt file. Repeat in multi-profile mode to create ordered prompt tasks.",
+    )
     parser.add_argument("--image", action="append", help="Input image path. Repeat for multi-image edits.")
     parser.add_argument("--mask", help="Optional edit mask path for the first input image")
     parser.add_argument("--filename", help="Filename under the output directory")
     parser.add_argument("--out", help="Exact output path")
     parser.add_argument("--output-dir", help="Output directory; default: $PWD/outputs")
     parser.add_argument("--workspace", help="Workspace root; default: current directory")
-    parser.add_argument("--auth-json", default=str(DEFAULT_AUTH_JSON))
     parser.add_argument("--image-auth-json", default=str(DEFAULT_IMAGE_AUTH_JSON))
-    parser.add_argument("--profile", help="Named relay profile. By default it is used after the primary relay fails.")
-    parser.add_argument(
-        "--use-profile",
-        action="store_true",
-        help="Use --profile, or the default image auth JSON, directly instead of trying the primary provider first.",
+    profile_selector = parser.add_mutually_exclusive_group()
+    profile_selector.add_argument(
+        "--profile",
+        help="Use one named inline profile from the relay auth JSON.",
     )
-    parser.add_argument("--config-toml", default=str(DEFAULT_CONFIG_TOML))
-    parser.add_argument("--provider", help="Model provider table name in config.toml; default: top-level model_provider")
+    profile_selector.add_argument(
+        "--profiles",
+        action="append",
+        metavar="NAME[,NAME...]",
+        help=(
+            "Distribute ordered prompt tasks across named inline profiles. "
+            "Repeat the option, use commas, or pass 'all'."
+        ),
+    )
+    profile_selector.add_argument(
+        "--profile-count",
+        type=int,
+        help=(
+            "Distribute ordered prompt tasks across the first N configured inline profiles; "
+            "N must be at least 2."
+        ),
+    )
     parser.add_argument("--python", help="Python executable to run the bundled imagegen CLI")
     parser.add_argument("--image-cli", default=str(default_cli_path()))
     parser.add_argument("--skip-install", action="store_true")
@@ -1106,102 +1271,55 @@ def main() -> int:
     workspace = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
-    auth_path = Path(args.auth_json).expanduser()
     image_auth_path = Path(args.image_auth_json).expanduser()
-    config_path = Path(args.config_toml).expanduser()
 
     if args.init_auth:
-        template_path = profile_file(image_auth_path, args.profile) if args.profile else image_auth_path
-        created = write_auth_template(template_path)
+        if args.profile or args.profiles or args.profile_count is not None:
+            fail("--init-auth cannot be combined with profile selection options")
+        created = write_auth_template(image_auth_path)
         action = "Created" if created else "Auth template already exists"
-        print(f"{action}: {template_path}")
+        print(f"{action}: {image_auth_path}")
         print("Fill OPENAI_API_KEY and OPENAI_BASE_URL in that local file. Do not commit it.")
         return 0
 
     if args.n < 1 or args.n > 10:
         fail("n must be between 1 and 10")
 
-    if args.use_profile:
-        selected_config, selected_source = resolve_relay_auth_config(
-            image_auth_path,
-            args.profile,
-            create_missing=True,
-        )
-        selected_api_key = resolve_api_key(
-            selected_config,
-            allow_env=False,
-            source=selected_source or str(image_auth_path),
-        )
-        selected_base_url = base_url_from_config(selected_config)
-        if not selected_base_url:
-            selected_base_url = normalize_openai_base_url(read_base_url(config_path, args.provider))
-        selected_args = resolve_attempt_args(args, selected_config)
-        out = choose_output(selected_args, workspace)
-        label = f"profile {args.profile!r}" if args.profile else "configured"
-        result = run_relay_attempt(
-            label=label,
-            args=selected_args,
-            api_key=selected_api_key,
-            base_url=selected_base_url,
-            out=out,
-            workspace=workspace,
-        )
-        return result.returncode
+    if args.profiles or args.profile_count is not None:
+        return run_parallel_profiles(args, image_auth_path, workspace)
 
-    provider_name, provider_table = read_provider_table(config_path, args.provider)
-    primary_base_url = normalize_openai_base_url(read_base_url(config_path, args.provider))
-    primary_config = read_json_object(auth_path)
-    api_key = api_key_from_provider_table(provider_table) or resolve_api_key(
-        primary_config,
-        allow_env=False,
-        source=f"{config_path} model_providers.{provider_name} or {auth_path}",
+    prompt_args = expand_prompt_args(args, workspace)
+    if len(prompt_args) != 1:
+        fail("multiple prompt inputs require --profiles or --profile-count")
+    args = prompt_args[0]
+
+    selected_config, selected_source = resolve_relay_auth_config(
+        image_auth_path,
+        args.profile,
+        create_missing=True,
     )
-    primary_args = resolve_attempt_args(args, provider_image_config(provider_table))
-    out = choose_output(primary_args, workspace)
+    selected_api_key = resolve_api_key(
+        selected_config,
+        source=selected_source or str(image_auth_path),
+    )
+    selected_base_url = base_url_from_config(selected_config)
+    if not selected_base_url:
+        fail(f"OPENAI_BASE_URL missing in {selected_source or image_auth_path}")
+    try:
+        selected_base_url = validate_http_base_url(selected_base_url)
+    except RelayRequestError as exc:
+        fail(str(exc))
+    selected_args = resolve_attempt_args(args, selected_config)
+    out = choose_output(selected_args, workspace)
+    label = f"profile {args.profile!r}" if args.profile else "default"
     result = run_relay_attempt(
-        label="primary",
-        args=primary_args,
-        api_key=api_key,
-        base_url=primary_base_url,
+        label=label,
+        args=selected_args,
+        api_key=selected_api_key,
+        base_url=selected_base_url,
         out=out,
         workspace=workspace,
     )
-    if (
-        result.returncode != 0
-        and not args.dry_run
-        and api_call_was_attempted(result)
-    ):
-        fallback_config, fallback_source = resolve_relay_auth_config(
-            image_auth_path,
-            args.profile,
-            create_missing=True,
-        )
-        fallback_api_key = resolve_api_key(
-            fallback_config,
-            allow_env=False,
-            source=fallback_source or str(image_auth_path),
-        )
-        fallback_base_url = base_url_from_config(fallback_config) or primary_base_url
-        fallback_args = resolve_attempt_args(args, fallback_config)
-        if attempt_signature(fallback_api_key, fallback_base_url, fallback_args) == attempt_signature(
-            api_key,
-            primary_base_url,
-            primary_args,
-        ):
-            print(
-                "Primary image call failed; fallback relay config matches the primary request, so no retry was attempted.",
-                file=sys.stderr,
-            )
-            return result.returncode
-        print("Primary image call failed; retrying with fallback relay config.", file=sys.stderr)
-        result = run_relay_attempt(
-            label="fallback",
-            args=fallback_args,
-            api_key=fallback_api_key,
-            base_url=fallback_base_url,
-            out=out,
-            workspace=workspace,
-        )
     return result.returncode
 
 
