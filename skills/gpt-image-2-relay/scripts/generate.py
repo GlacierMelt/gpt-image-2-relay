@@ -1,35 +1,90 @@
 #!/usr/bin/env python3
-"""Generate or edit images with the bundled imagegen CLI through the user's relay.
+"""Generate or edit images through configurable relay drivers.
 
 This wrapper intentionally keeps API keys out of command-line arguments and
-redacts key-like strings from child process output.
+redacts key-like strings from process output.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
+import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 
 DEFAULT_AUTH_JSON = Path.home() / ".codex" / "auth.json"
 DEFAULT_IMAGE_AUTH_JSON = Path.home() / ".codex" / "gpt-image-2-relay-auth.json"
 DEFAULT_CONFIG_TOML = Path.home() / ".codex" / "config.toml"
 DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_DRIVER = "auto"
+DEFAULT_SIZE = "1024x1024"
+DEFAULT_QUALITY = "medium"
+DEFAULT_RESPONSE_FORMAT = "url"
+DEFAULT_REQUEST_TIMEOUT = 600.0
+KNOWN_IMAGEGEN_MODELS = {
+    "gpt-image-2",
+    "gpt-image-1.5",
+    "gpt-image-1",
+    "gpt-image-1-mini",
+}
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
 BASE_URL_KEYS = ("OPENAI_BASE_URL", "base_url", "BASE_URL", "url")
 PROVIDER_API_KEY_KEYS = ("experimental_bearer_token", "OPENAI_API_KEY", "api_key", "bearer_token")
+IMAGE_RESPONSE_KEYS = {"url", "b64_json", "b64Json"}
+DRIVER_ALIASES = {
+    "auto": "auto",
+    "imagegen": "imagegen",
+    "system": "imagegen",
+    "openai-images": "openai-images",
+    "openai": "openai-images",
+    "direct": "openai-images",
+    "relay": "openai-images",
+}
+PROVIDER_IMAGE_OPTIONS = {
+    "driver": "image_driver",
+    "model": "image_model",
+    "size": "image_size",
+    "quality": "image_quality",
+    "response_format": "image_response_format",
+    "output_format": "image_output_format",
+    "style": "image_style",
+    "background": "image_background",
+    "upscale": "image_upscale",
+    "request_timeout": "image_request_timeout",
+    "extra_json": "image_extra_json",
+}
 AUTH_TEMPLATE_INSTRUCTIONS = (
-    "Fill OPENAI_API_KEY. Fill OPENAI_BASE_URL if this fallback should use a "
-    "different relay; leave it empty to reuse ~/.codex/config.toml. Keep this "
-    "file in ~/.codex and do not commit it."
+    "Fill OPENAI_API_KEY and OPENAI_BASE_URL. Optionally set driver, model, size, "
+    "quality, response_format, and output_format for this relay. Leave "
+    "OPENAI_BASE_URL empty to reuse ~/.codex/config.toml. Keep this file in "
+    "~/.codex and do not commit it."
 )
+
+
+@dataclass
+class DriverResult:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    attempted: bool = False
+
+
+class RelayRequestError(RuntimeError):
+    """Readable HTTP, response, or download error from a direct relay."""
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -94,6 +149,12 @@ def write_auth_template(path: Path) -> bool:
         "_instructions": AUTH_TEMPLATE_INSTRUCTIONS,
         "OPENAI_API_KEY": "",
         "OPENAI_BASE_URL": "",
+        "driver": "auto",
+        "model": "",
+        "size": "",
+        "quality": "",
+        "response_format": "",
+        "output_format": "",
     }
     path.write_text(json.dumps(template, indent=2) + "\n")
     try:
@@ -249,6 +310,7 @@ def read_base_url(path: Path, provider: str | None) -> str:
     value = table.get("base_url")
     if isinstance(value, str) and value.strip():
         return value.strip()
+
     fail(f"base_url missing for model provider {selected!r} in {path}")
 
 
@@ -259,6 +321,105 @@ def normalize_openai_base_url(value: str) -> str:
     if value.endswith("/v1"):
         return value
     return f"{value}/v1"
+
+
+def safe_base_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        try:
+            port_value = parsed.port
+        except ValueError:
+            port_value = None
+        port = f":{port_value}" if port_value else ""
+        return f"{parsed.scheme}://{host}{port}{parsed.path}".rstrip("/")
+    return value.split("?", 1)[0].split("#", 1)[0]
+
+
+def validate_http_base_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RelayRequestError(f"invalid relay base URL: {safe_base_url(value)!r}")
+    return value
+
+
+def provider_image_config(table: dict[str, Any]) -> dict[str, Any]:
+    return {
+        option: table[field]
+        for option, field in PROVIDER_IMAGE_OPTIONS.items()
+        if field in table
+    }
+
+
+def nonempty_config_value(config: dict[str, Any], key: str) -> Any:
+    value = config.get(key)
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def parse_extra_json(value: Any, source: str) -> dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            fail(f"{source} must contain a JSON object: {exc}")
+        if isinstance(parsed, dict):
+            return parsed
+    fail(f"{source} must be a JSON object")
+    return {}
+
+
+def resolve_driver(value: Any, model: str) -> str:
+    requested = str(value or DEFAULT_DRIVER).strip().lower()
+    driver = DRIVER_ALIASES.get(requested)
+    if not driver:
+        choices = ", ".join(sorted(DRIVER_ALIASES))
+        fail(f"unknown relay driver {requested!r}; choose one of: {choices}")
+    if driver == "auto":
+        return "imagegen" if model in KNOWN_IMAGEGEN_MODELS else "openai-images"
+    return driver
+
+
+def resolve_attempt_args(args: argparse.Namespace, config: dict[str, Any]) -> argparse.Namespace:
+    resolved = argparse.Namespace(**vars(args))
+
+    def choose(name: str, default: Any = None) -> Any:
+        cli_value = getattr(args, name, None)
+        if cli_value is not None:
+            return cli_value
+        config_value = nonempty_config_value(config, name)
+        return default if config_value is None else config_value
+
+    resolved.model = str(choose("model", DEFAULT_MODEL)).strip()
+    if not resolved.model:
+        fail("model must not be empty")
+    resolved.driver = resolve_driver(choose("driver", DEFAULT_DRIVER), resolved.model)
+    resolved.size = str(choose("size", DEFAULT_SIZE)).strip()
+    resolved.quality = str(choose("quality", DEFAULT_QUALITY)).strip()
+    resolved.response_format = str(choose("response_format", DEFAULT_RESPONSE_FORMAT)).strip()
+    if resolved.response_format not in {"url", "b64_json"}:
+        fail("response-format must be url or b64_json")
+    resolved.output_format = choose("output_format")
+    resolved.style = choose("style")
+    resolved.background = choose("background")
+    resolved.upscale = choose("upscale")
+    try:
+        resolved.request_timeout = float(choose("request_timeout", DEFAULT_REQUEST_TIMEOUT))
+    except (TypeError, ValueError):
+        fail("request-timeout must be a number")
+    if resolved.request_timeout <= 0:
+        fail("request-timeout must be greater than zero")
+    extra_value = args.extra_json if args.extra_json is not None else nonempty_config_value(config, "extra_json")
+    resolved.extra_json = parse_extra_json(extra_value, "extra-json")
+    return resolved
 
 
 def ensure_runtime(workspace: Path, requested_python: str | None, skip_install: bool) -> Path:
@@ -342,6 +503,376 @@ def resolve_existing_path(path: str, workspace: Path) -> str:
     return str(candidate)
 
 
+def read_prompt_text(args: argparse.Namespace, workspace: Path) -> str:
+    if args.prompt is not None:
+        prompt = args.prompt
+    elif args.prompt_file:
+        prompt_path = Path(args.prompt_file).expanduser()
+        prompt_path = prompt_path if prompt_path.is_absolute() else workspace / prompt_path
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            fail(f"prompt file not found: {prompt_path}")
+    else:
+        fail("provide --prompt or --prompt-file")
+    prompt = prompt.strip()
+    if not prompt:
+        fail("prompt must not be empty")
+    return prompt
+
+
+def augment_prompt(args: argparse.Namespace, prompt: str) -> str:
+    if args.no_augment:
+        return prompt
+    fields = (
+        ("Use case", args.use_case),
+        ("Primary request", prompt),
+        ("Scene/background", args.scene),
+        ("Subject", args.subject),
+        ("Style/medium", args.style),
+        ("Composition/framing", args.composition),
+        ("Lighting/mood", args.lighting),
+        ("Color palette", args.palette),
+        ("Materials/textures", args.materials),
+        ("Text (verbatim)", f'"{args.text}"' if args.text else None),
+        ("Constraints", args.constraints),
+        ("Avoid", args.negative),
+    )
+    return "\n".join(f"{label}: {value}" for label, value in fields if value)
+
+
+def compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def embedded_error(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if error:
+        if isinstance(error, dict):
+            return str(error.get("message") or compact_json(error))
+        return str(error)
+    code = payload.get("code")
+    if code not in (None, 0, "0", 200, "200") and payload.get("data") is None:
+        return str(payload.get("msg") or payload.get("message") or compact_json(payload))
+    return None
+
+
+def decode_json_body(raw: bytes, content_type: str | None = None) -> Any:
+    if not raw:
+        return {}
+    charset = "utf-8"
+    if content_type and "charset=" in content_type:
+        charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
+    text = raw.decode(charset, errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RelayRequestError(f"expected JSON response, received: {text[:1000]}") from exc
+
+
+def request_relay_json(
+    *,
+    method: str,
+    url: str,
+    api_key: str,
+    timeout: float,
+    payload: dict[str, Any] | None = None,
+    body: bytes | None = None,
+    content_type: str | None = None,
+) -> Any:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "gpt-image-2-relay-skill/2.0",
+    }
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        content_type = "application/json"
+    if content_type:
+        headers["Content-Type"] = content_type
+    request = Request(url, data=body, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            result = decode_json_body(response.read(), response.headers.get("Content-Type"))
+    except HTTPError as exc:
+        raw = exc.read()
+        try:
+            detail = decode_json_body(raw, exc.headers.get("Content-Type"))
+            message = embedded_error(detail) or compact_json(detail)
+        except RelayRequestError:
+            message = raw.decode("utf-8", errors="replace")[:2000]
+        raise RelayRequestError(f"HTTP {exc.code} from {safe_base_url(url)}: {message}") from exc
+    except URLError as exc:
+        raise RelayRequestError(f"request failed for {safe_base_url(url)}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RelayRequestError(f"request timed out for {safe_base_url(url)}") from exc
+
+    message = embedded_error(result)
+    if message:
+        raise RelayRequestError(f"API error from {safe_base_url(url)}: {message}")
+    return result
+
+
+def validate_reference_images(paths: Iterable[str], workspace: Path) -> list[Path]:
+    images = [Path(resolve_existing_path(path, workspace)) for path in paths]
+    if len(images) > 8:
+        fail("the direct relay driver accepts at most 8 reference images")
+    total = sum(path.stat().st_size for path in images)
+    if total > 40 * 1024 * 1024:
+        fail("reference images exceed the direct relay driver's 40 MB total limit")
+    return images
+
+
+def multipart_body(fields: dict[str, Any], files: list[tuple[str, Path]]) -> tuple[bytes, str]:
+    boundary = f"----gpt-image-relay-{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    def add_line(value: str = "") -> None:
+        chunks.append(value.encode("utf-8") + b"\r\n")
+
+    for name, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            value = compact_json(value)
+        add_line(f"--{boundary}")
+        add_line(f'Content-Disposition: form-data; name="{name}"')
+        add_line()
+        add_line(str(value))
+
+    for field_name, path in files:
+        filename = path.name.replace('"', "_")
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        add_line(f"--{boundary}")
+        add_line(f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"')
+        add_line(f"Content-Type: {mime_type}")
+        add_line()
+        chunks.append(path.read_bytes())
+        chunks.append(b"\r\n")
+
+    add_line(f"--{boundary}--")
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def parse_json_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def find_image_items(value: Any) -> list[dict[str, Any]] | None:
+    value = parse_json_string(value)
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            if any(IMAGE_RESPONSE_KEYS.intersection(item) for item in value):
+                return value
+        for item in value:
+            found = find_image_items(item)
+            if found:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    for key in ("data", "images"):
+        items = value.get(key)
+        if isinstance(items, list) and items and all(isinstance(item, dict) for item in items):
+            if any(IMAGE_RESPONSE_KEYS.intersection(item) for item in items):
+                return items
+    for key in ("response", "responseBody", "response_body", "result", "output", "data", "job"):
+        if key in value:
+            found = find_image_items(value[key])
+            if found:
+                return found
+    return None
+
+
+def output_paths(out: Path, count: int, force: bool) -> list[Path]:
+    if count == 1:
+        candidates = [out]
+    else:
+        candidates = [out.with_name(f"{out.stem}-{index}{out.suffix}") for index in range(1, count + 1)]
+    return [path if force or not path.exists() else unique_path(path) for path in candidates]
+
+
+def download_relay_image(url: str, destination: Path, api_key: str, base_url: str, timeout: float) -> None:
+    base = validate_http_base_url(base_url)
+    origin = f"{urlparse(base).scheme}://{urlparse(base).netloc}"
+    absolute_url = urljoin(f"{origin}/", url)
+    parsed = urlparse(absolute_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RelayRequestError(f"invalid image URL in relay response: {safe_base_url(absolute_url)!r}")
+    headers = {"User-Agent": "gpt-image-2-relay-skill/2.0"}
+
+    def fetch(current_headers: dict[str, str]) -> bytes:
+        request = Request(absolute_url, headers=current_headers, method="GET")
+        with urlopen(request, timeout=timeout) as response:
+            return response.read()
+
+    try:
+        data = fetch(headers)
+    except HTTPError as exc:
+        same_origin = f"{parsed.scheme}://{parsed.netloc}" == origin
+        if exc.code not in {401, 403} or not same_origin:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            raise RelayRequestError(f"image download failed with HTTP {exc.code}: {detail}") from exc
+        headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            data = fetch(headers)
+        except (HTTPError, URLError) as retry_exc:
+            raise RelayRequestError(f"authenticated image download failed: {retry_exc}") from retry_exc
+    except URLError as exc:
+        raise RelayRequestError(f"image download failed: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RelayRequestError("image download timed out") from exc
+    destination.write_bytes(data)
+
+
+def save_relay_images(
+    response: Any,
+    out: Path,
+    api_key: str,
+    base_url: str,
+    timeout: float,
+    force: bool,
+) -> list[Path]:
+    items = find_image_items(response)
+    if not items:
+        raise RelayRequestError("relay response did not contain url or b64_json image data")
+    destinations = output_paths(out, len(items), force)
+    saved: list[Path] = []
+    for item, destination in zip(items, destinations):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        encoded = item.get("b64_json") or item.get("b64Json")
+        if encoded:
+            encoded = str(encoded)
+            if encoded.startswith("data:") and "," in encoded:
+                encoded = encoded.split(",", 1)[1]
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise RelayRequestError("relay returned invalid Base64 image data") from exc
+            destination.write_bytes(data)
+        elif item.get("url"):
+            download_relay_image(str(item["url"]), destination, api_key, base_url, timeout)
+        else:
+            continue
+        saved.append(destination)
+    if not saved:
+        raise RelayRequestError("relay response did not contain usable image data")
+    return saved
+
+
+def direct_relay_payload(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
+    payload = dict(args.extra_json)
+    payload.update(
+        {
+            "model": args.model,
+            "prompt": prompt,
+            "n": args.n,
+            "size": args.size,
+            "quality": args.quality,
+            "response_format": args.response_format,
+        }
+    )
+    for key in ("style", "background", "output_format", "upscale", "output_compression", "moderation"):
+        value = getattr(args, key, None)
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def run_openai_images_driver(
+    *,
+    label: str,
+    args: argparse.Namespace,
+    api_key: str,
+    base_url: str,
+    out: Path,
+    workspace: Path,
+) -> DriverResult:
+    command = "edit" if args.image or args.mode == "edit" else "generate"
+    if args.mode == "edit" and not args.image:
+        return DriverResult(2, stderr="--mode edit requires at least one --image\n")
+    if args.mode == "generate" and args.image:
+        return DriverResult(2, stderr="--mode generate cannot be combined with --image\n")
+    if args.downscale_max_dim is not None:
+        return DriverResult(2, stderr="--downscale-max-dim is not supported by the openai-images driver\n")
+
+    try:
+        relay_base_url = validate_http_base_url(base_url)
+    except RelayRequestError as exc:
+        return DriverResult(2, stderr=f"{exc}\n")
+    prompt = augment_prompt(args, read_prompt_text(args, workspace))
+    payload = direct_relay_payload(args, prompt)
+    endpoint = f"{relay_base_url}/images/{'edits' if command == 'edit' else 'generations'}"
+
+    print(f"Using {label} relay base URL: {safe_base_url(relay_base_url)}")
+    print(f"Using {label} relay driver: openai-images (model: {args.model})")
+    print(f"Writing output: {out}")
+    if args.dry_run:
+        preview = {
+            "driver": "openai-images",
+            "endpoint": safe_base_url(endpoint),
+            "output": str(out),
+            **payload,
+        }
+        if command == "edit":
+            preview["images"] = [resolve_existing_path(path, workspace) for path in args.image or []]
+            if args.mask:
+                preview["mask"] = resolve_existing_path(args.mask, workspace)
+        print(json.dumps(preview, ensure_ascii=False, indent=2, sort_keys=True))
+        print(f"Dry-run output path: {out}")
+        return DriverResult(0)
+
+    try:
+        if command == "generate":
+            response = request_relay_json(
+                method="POST",
+                url=endpoint,
+                api_key=api_key,
+                timeout=args.request_timeout,
+                payload=payload,
+            )
+        else:
+            images = validate_reference_images(args.image or [], workspace)
+            image_field = "image" if len(images) == 1 else "image[]"
+            files = [(image_field, path) for path in images]
+            if args.mask:
+                files.append(("mask", Path(resolve_existing_path(args.mask, workspace))))
+            body, content_type = multipart_body(payload, files)
+            response = request_relay_json(
+                method="POST",
+                url=endpoint,
+                api_key=api_key,
+                timeout=args.request_timeout,
+                body=body,
+                content_type=content_type,
+            )
+        saved = save_relay_images(
+            response,
+            out,
+            api_key,
+            relay_base_url,
+            args.request_timeout,
+            args.force,
+        )
+    except RelayRequestError as exc:
+        message = sanitize(str(exc), api_key)
+        return DriverResult(1, stderr=f"Direct relay request failed: {message}\n", attempted=True)
+
+    for path in saved:
+        print(f"Final output: {path}")
+    return DriverResult(0, stdout="\n".join(str(path) for path in saved), attempted=True)
+
+
 def build_command(args: argparse.Namespace, python_path: Path, cli_path: Path, out: Path, workspace: Path) -> list[str]:
     if not cli_path.exists():
         fail(f"imagegen CLI not found: {cli_path}")
@@ -377,6 +908,7 @@ def build_command(args: argparse.Namespace, python_path: Path, cli_path: Path, o
     add_optional(cmd, "--output-format", args.output_format)
     add_optional(cmd, "--output-compression", args.output_compression)
     add_optional(cmd, "--moderation", args.moderation)
+    add_optional(cmd, "--background", args.background)
     add_optional(cmd, "--use-case", args.use_case)
     add_optional(cmd, "--scene", args.scene)
     add_optional(cmd, "--subject", args.subject)
@@ -406,12 +938,12 @@ def run_image_command(
     base_url: str,
     out: Path,
     args: argparse.Namespace,
-) -> subprocess.CompletedProcess[str]:
+) -> DriverResult:
     env = os.environ.copy()
     env["OPENAI_API_KEY"] = api_key
     env["OPENAI_BASE_URL"] = base_url
 
-    print(f"Using {label} relay base URL: {base_url}")
+    print(f"Using {label} relay base URL: {safe_base_url(base_url)}")
     print(f"Writing output: {out}")
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
 
@@ -425,11 +957,16 @@ def run_image_command(
         print(f"Dry-run output path: {out}")
     elif result.returncode == 0:
         print(f"Final output: {out}")
-    return result
+    return DriverResult(
+        returncode=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        attempted=api_call_was_attempted_output(result.stdout, result.stderr),
+    )
 
 
-def api_call_was_attempted(result: subprocess.CompletedProcess[str]) -> bool:
-    combined = f"{result.stdout}\n{result.stderr}"
+def api_call_was_attempted_output(stdout: str, stderr: str) -> bool:
+    combined = f"{stdout}\n{stderr}"
     return (
         "Calling Image API" in combined
         or "Error code:" in combined
@@ -440,8 +977,72 @@ def api_call_was_attempted(result: subprocess.CompletedProcess[str]) -> bool:
     )
 
 
+def api_call_was_attempted(result: DriverResult) -> bool:
+    return result.attempted or api_call_was_attempted_output(result.stdout, result.stderr)
+
+
+def run_relay_attempt(
+    *,
+    label: str,
+    args: argparse.Namespace,
+    api_key: str,
+    base_url: str,
+    out: Path,
+    workspace: Path,
+) -> DriverResult:
+    if args.driver == "openai-images":
+        result = run_openai_images_driver(
+            label=label,
+            args=args,
+            api_key=api_key,
+            base_url=base_url,
+            out=out,
+            workspace=workspace,
+        )
+    elif args.driver == "imagegen":
+        python_path = ensure_runtime(workspace, args.python, args.skip_install)
+        cli_path = Path(args.image_cli).expanduser()
+        cmd = build_command(args, python_path, cli_path, out, workspace)
+        print(f"Using {label} relay driver: imagegen (model: {args.model})")
+        result = run_image_command(
+            label=label,
+            cmd=cmd,
+            api_key=api_key,
+            base_url=base_url,
+            out=out,
+            args=args,
+        )
+    else:
+        result = DriverResult(2, stderr=f"unsupported relay driver: {args.driver}\n")
+
+    if result.stderr and result.returncode != 0 and args.driver == "openai-images":
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+    return result
+
+
+def attempt_signature(
+    api_key: str,
+    base_url: str,
+    args: argparse.Namespace,
+) -> tuple[Any, ...]:
+    return (
+        api_key,
+        base_url.rstrip("/"),
+        args.driver,
+        args.model,
+        args.size,
+        args.quality,
+        args.response_format,
+        args.output_format,
+        args.style,
+        args.background,
+        args.upscale,
+        compact_json(args.extra_json),
+    )
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate or edit GPT Image 2 images through the configured relay.")
+    parser = argparse.ArgumentParser(description="Generate or edit images through configurable relay drivers.")
     parser.add_argument("--mode", choices=["auto", "generate", "edit"], default="auto")
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file")
@@ -453,21 +1054,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", help="Workspace root; default: current directory")
     parser.add_argument("--auth-json", default=str(DEFAULT_AUTH_JSON))
     parser.add_argument("--image-auth-json", default=str(DEFAULT_IMAGE_AUTH_JSON))
-    parser.add_argument("--profile", help="Named fallback relay profile. Reads ~/.codex/gpt-image-2-relay-<profile>.json or profiles.<profile> from --image-auth-json after the primary config fails.")
+    parser.add_argument("--profile", help="Named relay profile. By default it is used after the primary relay fails.")
+    parser.add_argument(
+        "--use-profile",
+        action="store_true",
+        help="Use --profile, or the default image auth JSON, directly instead of trying the primary provider first.",
+    )
     parser.add_argument("--config-toml", default=str(DEFAULT_CONFIG_TOML))
     parser.add_argument("--provider", help="Model provider table name in config.toml; default: top-level model_provider")
     parser.add_argument("--python", help="Python executable to run the bundled imagegen CLI")
     parser.add_argument("--image-cli", default=str(default_cli_path()))
     parser.add_argument("--skip-install", action="store_true")
-    parser.add_argument("--init-auth", action="store_true", help="Create a local fallback auth template and exit.")
+    parser.add_argument("--init-auth", action="store_true", help="Create a local relay auth template and exit.")
 
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--size", default="1024x1024")
-    parser.add_argument("--quality", default="medium")
+    parser.add_argument(
+        "--driver",
+        help="Relay driver: auto, imagegen, or openai-images. Config may also set driver.",
+    )
+    parser.add_argument("--model", help=f"Image model; default: config value or {DEFAULT_MODEL}")
+    parser.add_argument("--size", help=f"Pixel size or relay-specific ratio; default: {DEFAULT_SIZE}")
+    parser.add_argument("--quality", help=f"Image quality; default: {DEFAULT_QUALITY}")
     parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--output-format")
     parser.add_argument("--output-compression", type=int)
     parser.add_argument("--moderation")
+    parser.add_argument("--response-format", choices=("url", "b64_json"))
+    parser.add_argument("--background")
+    parser.add_argument("--upscale")
+    parser.add_argument("--request-timeout", type=float)
+    parser.add_argument("--extra-json", help="Additional JSON object for the openai-images request payload.")
     parser.add_argument("--use-case")
     parser.add_argument("--scene")
     parser.add_argument("--subject")
@@ -503,28 +1118,53 @@ def main() -> int:
         print("Fill OPENAI_API_KEY and OPENAI_BASE_URL in that local file. Do not commit it.")
         return 0
 
-    primary_config = read_json_object(auth_path)
-    provider_name, provider_table = read_provider_table(config_path, args.provider)
+    if args.n < 1 or args.n > 10:
+        fail("n must be between 1 and 10")
 
+    if args.use_profile:
+        selected_config, selected_source = resolve_relay_auth_config(
+            image_auth_path,
+            args.profile,
+            create_missing=True,
+        )
+        selected_api_key = resolve_api_key(
+            selected_config,
+            allow_env=False,
+            source=selected_source or str(image_auth_path),
+        )
+        selected_base_url = base_url_from_config(selected_config)
+        if not selected_base_url:
+            selected_base_url = normalize_openai_base_url(read_base_url(config_path, args.provider))
+        selected_args = resolve_attempt_args(args, selected_config)
+        out = choose_output(selected_args, workspace)
+        label = f"profile {args.profile!r}" if args.profile else "configured"
+        result = run_relay_attempt(
+            label=label,
+            args=selected_args,
+            api_key=selected_api_key,
+            base_url=selected_base_url,
+            out=out,
+            workspace=workspace,
+        )
+        return result.returncode
+
+    provider_name, provider_table = read_provider_table(config_path, args.provider)
+    primary_base_url = normalize_openai_base_url(read_base_url(config_path, args.provider))
+    primary_config = read_json_object(auth_path)
     api_key = api_key_from_provider_table(provider_table) or resolve_api_key(
         primary_config,
         allow_env=False,
         source=f"{config_path} model_providers.{provider_name} or {auth_path}",
     )
-    base_url = normalize_openai_base_url(read_base_url(config_path, args.provider))
-
-    python_path = ensure_runtime(workspace, args.python, args.skip_install)
-    cli_path = Path(args.image_cli).expanduser()
-    out = choose_output(args, workspace)
-    cmd = build_command(args, python_path, cli_path, out, workspace)
-
-    result = run_image_command(
+    primary_args = resolve_attempt_args(args, provider_image_config(provider_table))
+    out = choose_output(primary_args, workspace)
+    result = run_relay_attempt(
         label="primary",
-        cmd=cmd,
+        args=primary_args,
         api_key=api_key,
-        base_url=base_url,
+        base_url=primary_base_url,
         out=out,
-        args=args,
+        workspace=workspace,
     )
     if (
         result.returncode != 0
@@ -541,21 +1181,26 @@ def main() -> int:
             allow_env=False,
             source=fallback_source or str(image_auth_path),
         )
-        fallback_base_url = base_url_from_config(fallback_config) or base_url
-        if fallback_api_key == api_key and fallback_base_url == base_url:
+        fallback_base_url = base_url_from_config(fallback_config) or primary_base_url
+        fallback_args = resolve_attempt_args(args, fallback_config)
+        if attempt_signature(fallback_api_key, fallback_base_url, fallback_args) == attempt_signature(
+            api_key,
+            primary_base_url,
+            primary_args,
+        ):
             print(
-                "Primary GPT Image 2 call failed; fallback relay config matches the primary config, so no retry was attempted.",
+                "Primary image call failed; fallback relay config matches the primary request, so no retry was attempted.",
                 file=sys.stderr,
             )
             return result.returncode
-        print("Primary GPT Image 2 call failed; retrying with fallback relay config.", file=sys.stderr)
-        result = run_image_command(
+        print("Primary image call failed; retrying with fallback relay config.", file=sys.stderr)
+        result = run_relay_attempt(
             label="fallback",
-            cmd=cmd,
+            args=fallback_args,
             api_key=fallback_api_key,
             base_url=fallback_base_url,
             out=out,
-            args=args,
+            workspace=workspace,
         )
     return result.returncode
 
