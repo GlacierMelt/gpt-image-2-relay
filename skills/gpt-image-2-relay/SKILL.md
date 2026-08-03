@@ -1,6 +1,6 @@
 ---
 name: gpt-image-2-relay
-description: Generate or edit raster images through one or multiple configurable OpenAI-compatible relay APIs, using standard GPT Image models or arbitrary relay model IDs and aliases. Use for GPT Image 2, custom or Chinese model IDs, concurrent multi-API prompt distribution, image editing, enhancement, upscaling, product shots, mockups, illustrations, and other bitmap creation or transformation without re-explaining relay credentials.
+description: Generate or edit raster images through one or multiple configurable OpenAI-compatible relay APIs, using standard GPT Image models or arbitrary relay model IDs and aliases. Use for GPT Image 2, custom or Chinese model IDs, guarded multi-API prompt distribution, image editing, enhancement, upscaling, product shots, mockups, illustrations, and other bitmap creation or transformation without re-explaining relay credentials.
 ---
 
 # GPT Image Relay
@@ -9,14 +9,15 @@ Use the wrapper for standard GPT Image models and relay-specific model IDs. Keep
 
 ## Defaults
 
-- Driver: `auto`; known system models use `imagegen`, while every other exact model ID uses `openai-images`
+- Driver: `openai-images`; `auto` is a compatibility alias for the same single-attempt direct relay driver
 - Model: selected relay config, then `gpt-image-2`
 - Single-API behavior is the default. Without `--profiles` or `--profile-count`, inline `profiles` are never called automatically.
-- Concurrent multi-API behavior is explicit. Use `--profiles` to choose names or all configured profiles, or `--profile-count` to choose the first N configured profiles.
+- Multi-API behavior is explicit. Use `--profiles` to choose names or all configured profiles, or `--profile-count` to choose the first N configured profiles.
+- Multi-profile tasks run sequentially by default and stop after the first failure. Use `--parallel-profiles` only when the user explicitly accepts that all in-flight tasks may become billable before a failure is known.
 - In multi-profile mode, repeat `--prompt` and/or `--prompt-file` in the intended order. Assign each prompt once, round-robin, across the selected profiles.
 - Only config source: `~/.codex/gpt-image-2-relay-auth.json`; do not read `~/.codex/config.toml`, `~/.codex/auth.json`, or API-key environment variables.
 - Default single API: top-level fields in `~/.codex/gpt-image-2-relay-auth.json`.
-- Named single API and concurrent APIs: the inline `profiles` object in the same JSON file.
+- Named single API and multi-API profiles: the inline `profiles` object in the same JSON file.
 - Missing relay auth JSON is created as a local empty template when `--init-auth` is used or a generation command first needs it.
 - JSON auth API key fields: `OPENAI_API_KEY` or `api_key`
 - Relay base URL fields: `OPENAI_BASE_URL`, `base_url`, `BASE_URL`, or `url`
@@ -29,11 +30,11 @@ Never print, echo, persist, or place API keys in command arguments. The wrapper 
 
 ## Drivers
 
-- `auto`: Use `imagegen` only for known system model IDs. Use `openai-images` for every other ID, including custom IDs that begin with `gpt-image-`.
-- `imagegen`: Use the bundled system CLI and its strict GPT Image validation.
+- `auto`: Use the single-attempt `openai-images` driver. Do not delegate retry policy to an SDK.
+- `imagegen`: Use the bundled system CLI and its strict GPT Image validation only when explicitly requested. Its SDK may retry transient failures internally, so obtain the user's explicit acceptance before using it for a billable relay request.
 - `openai-images`: Call `/images/generations` or `/images/edits` directly. Pass `model`, `size`, `quality`, and supported optional fields unchanged. Accept URL and Base64 image responses.
 
-Set `driver` in a relay config or pass `--driver`. Prefer explicit `openai-images` for custom relays. Do not add individual model IDs to the wrapper; model support is determined by the selected relay.
+Set `driver` in a relay config or pass `--driver`. Prefer `openai-images` for relay calls because it sends each prompt exactly once. Do not add individual model IDs to the wrapper; model support is determined by the selected relay.
 
 ## Relay Config
 
@@ -55,7 +56,7 @@ Fill the template locally:
 
 ```json
 {
-  "_instructions": "The top-level relay remains the default single API. Fill profiles only for concurrent multi-API generation.",
+  "_instructions": "The top-level relay remains the default single API. Fill profiles only for explicit multi-API generation.",
   "OPENAI_API_KEY": "",
   "OPENAI_BASE_URL": "",
   "driver": "openai-images",
@@ -81,7 +82,7 @@ Fill the template locally:
 }
 ```
 
-Treat the `model` and `size` values above as opaque relay values. Examples such as `特惠image2`, `gpt-image-2-4K 高质量线路`, `3:2`, and `21:9` require no code changes. Keep only `OPENAI_API_KEY` and `OPENAI_BASE_URL` in each concurrent profile unless that relay genuinely needs a request-setting override.
+Treat the `model` and `size` values above as opaque relay values. Examples such as `特惠image2`, `gpt-image-2-4K 高质量线路`, `3:2`, and `21:9` require no code changes. Keep only `OPENAI_API_KEY` and `OPENAI_BASE_URL` in each multi-API profile unless that relay genuinely needs a request-setting override.
 
 Never add filled auth JSON files to the skill folder, workspace, or GitHub repository.
 
@@ -94,7 +95,7 @@ python "${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-relay/scripts/generate.py
   --filename "$FILENAME"
 ```
 
-Named single-relay and concurrent profiles live inside the same JSON file:
+Named single-relay and multi-API profiles live inside the same JSON file:
 
 ```json
 {
@@ -111,9 +112,9 @@ Named single-relay and concurrent profiles live inside the same JSON file:
 }
 ```
 
-The top-level `driver`, `model`, `size`, and other image settings are shared by concurrent profiles. Explicit CLI options override profile-specific settings, which override shared top-level settings, which override built-in defaults.
+The top-level `driver`, `model`, `size`, and other image settings are shared by multi-API profiles. Explicit CLI options override profile-specific settings, which override shared top-level settings, which override built-in defaults.
 
-### Concurrent Multi-API Prompt Distribution
+### Multi-API Prompt Distribution
 
 Do not pass a multi-profile option for normal single-API generation. To assign two prompts to an exact two-profile subset:
 
@@ -154,13 +155,14 @@ Multi-profile mode:
 - Requires at least two profiles and does not call the top-level single API.
 - Treats every repeated `--prompt` or `--prompt-file` as one ordered prompt task and sends each task exactly once.
 - Assigns prompt task `i` to selected profile `(i - 1) % profile_count`. Do not broadcast one prompt to every profile.
-- Runs different profile queues concurrently. Run multiple tasks assigned to the same profile sequentially in their original order.
+- Runs tasks sequentially in their original order by default. Stop before starting later tasks when one task fails.
+- Runs different profile queues concurrently only with explicit `--parallel-profiles`; tasks assigned to the same profile remain sequential.
 - Leaves extra selected profiles unused when there are fewer prompts than profiles. A single prompt goes only to the first selected profile.
 - Writes task- and profile-isolated files such as `image--p001--relay-1.png` and `image--p004--relay-1.png` when multiple prompts are supplied.
 - Preserves successful outputs but exits nonzero if any prompt task fails.
 - Bills per prompt task, not per selected profile. With five prompts and `--n 2`, up to ten images may be generated and billed.
 
-Resolve single-relay request settings in this order: explicit CLI option, selected relay config, built-in default. Resolve concurrent inline-profile settings in this order: explicit CLI option, selected profile override, shared top-level auth JSON setting, built-in default.
+Resolve single-relay request settings in this order: explicit CLI option, selected relay config, built-in default. Resolve multi-profile settings in this order: explicit CLI option, selected profile override, shared top-level auth JSON setting, built-in default.
 
 ## Workflow
 
@@ -172,6 +174,8 @@ Resolve single-relay request settings in this order: explicit CLI option, select
 6. Inspect the generated image before reporting success when the task asks for a final asset.
 7. For a requested multi-API run, pass each prompt as a separate repeated `--prompt` or `--prompt-file` option in the intended order. Honor explicit profile names or counts. If the user asks for multiple APIs without a count, default to `--profile-count 2`; use `--profiles all` only when the user explicitly requests every configured API.
 8. State that each prompt task is a separate billable request before starting a non-dry multi-API run.
+9. Treat timeouts, disconnects, HTTP `408`, and HTTP `5xx` as indeterminate outcomes that may already be billed. Wait for the relay's `retry_after` value or `--failure-wait`, stop the batch, and do not resend automatically.
+10. Never change quality, size, model, driver, or profile and rerun a failed prompt as an automatic fallback. Resume only after the user explicitly requests another billable attempt.
 
 ## Generate
 
@@ -238,6 +242,8 @@ For edits, prefer a relay-supported size larger than the source when the user as
 - `--profile`: Use one named inline profile instead of the top-level default API.
 - `--profiles`: Distribute ordered prompt tasks round-robin across comma-separated/repeated inline profile names, or pass `all`.
 - `--profile-count`: Distribute ordered prompt tasks round-robin across the first N fully configured inline profiles; N must be at least 2.
+- `--parallel-profiles`: Opt into concurrent profile queues. Omit it for guarded sequential execution that stops after the first failure.
+- `--failure-wait`: Seconds to wait after a transient or indeterminate failure; default `120`. Waiting never resends a request.
 - `--n`: Images requested per prompt task; default `1`.
 - `--use-case`, `--style`, `--composition`, `--lighting`, `--constraints`, `--negative`: Prompt augmentation hints. The direct driver also forwards `style` as a native relay field.
 - `--dry-run`: Validate command construction without calling the API.
@@ -250,10 +256,14 @@ Do not request `background=transparent` with standard `gpt-image-2`; the system 
 
 ## Failure Handling
 
+- Never automatically retry a failed generation or edit request. A timeout, disconnect, HTTP `408`, or HTTP `5xx` can mean the relay accepted and billed the request even though the client received no image.
+- Keep the default `openai-images` driver for billable relay work. Do not use `imagegen` unless the user explicitly accepts its SDK-level retry behavior.
+- In multi-profile mode, use the default guarded sequential execution. On the first failure, wait, leave remaining prompt tasks unstarted, and return the per-task summary.
+- Do not rerun the whole batch, lower quality, or probe another profile after an indeterminate failure. Require a new explicit user instruction before sending another potentially billable request.
 - If authentication fails, tell the user the configured relay key appears invalid for the configured relay; do not print the key.
 - If the relay auth JSON is missing, the wrapper creates an empty local template and tells the user to fill `OPENAI_API_KEY` and `OPENAI_BASE_URL`; do not ask them to put credentials in the GitHub repo.
 - If the relay returns `model_not_found`, report the exact configured model ID without silently replacing it.
 - If dependency installation fails, report that `$PWD/work/.venv` could not install `openai`.
 - If a direct relay returns no `url` or `b64_json`, report the response-shape incompatibility.
 - If an output already exists and replacement was not requested, rerun with a unique filename or pass `--force` only when the user explicitly wants replacement.
-- If one concurrent prompt task fails, allow all other queued tasks to finish, keep their successful outputs, report the per-task summary, and treat the overall command as failed.
+- In explicit `--parallel-profiles` mode, allow already queued tasks to finish after one fails, keep successful outputs, report the per-task summary, and treat the overall command as failed.

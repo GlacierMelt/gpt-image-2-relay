@@ -1,15 +1,18 @@
 # GPT Image Relay Skill
 
-Codex skill for generating and editing images through configurable OpenAI-compatible relay APIs. It supports standard GPT Image models, arbitrary relay model IDs, direct image generations and edits, and concurrent multi-API prompt distribution.
+Codex skill for generating and editing images through configurable OpenAI-compatible relay APIs. It supports standard GPT Image models, arbitrary relay model IDs, direct image generations and edits, and guarded multi-API prompt distribution.
 
 ## What It Does
 
-- Selects `imagegen` for known system models and `openai-images` for custom relay models.
+- Uses the single-attempt `openai-images` driver by default; `auto` is a compatibility alias for the same behavior.
 - Passes exact relay `model`, `size`, and `quality` values through unchanged.
 - Handles URL and Base64 image responses and multipart image edits.
 - Reads relay credentials only from `~/.codex/gpt-image-2-relay-auth.json`.
 - Keeps the top-level fields as the default single API and uses inline `profiles` only when explicitly selected.
 - Distributes repeated prompts across selected profiles without broadcasting one prompt to every API.
+- Runs multi-profile tasks sequentially by default and stops after the first failure.
+- Supports explicit `--parallel-profiles` execution when the user accepts that all in-flight tasks may be billable.
+- Waits after transient or indeterminate failures without automatically resending the request.
 - Writes generated assets to the current workspace's `outputs/` directory.
 
 ## Install
@@ -128,7 +131,7 @@ Use these expected outcomes when testing from Codex:
 | Fewer prompts than APIs | 3 | 2 | 1 | 2 | Leave the third profile unused |
 | Two images per prompt | 3 | 3 | 2 | 3 | Send three requests with `n=2`; expect up to six images |
 
-`n=2` means two requested images for each prompt task. It does not mean two prompts per API and does not change profile assignment. Before a real multi-API run, Codex should report that every prompt task is a separate billable request.
+`n=2` means two requested images for each prompt task. It does not mean two prompts per API and does not change profile assignment. Before a real multi-API run, Codex should report that every prompt task is a separate billable request. A timeout, disconnect, HTTP `408`, or HTTP `5xx` may still be billable, so the wrapper waits and stops without automatically retrying.
 
 ## Single API
 
@@ -165,7 +168,21 @@ python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
 
 The assignment is `prompt 1 -> relay_1`, `prompt 2 -> relay_2`, and `prompt 3 -> relay_3`. With five prompts and two profiles, the assignment is `1 -> relay_1`, `2 -> relay_2`, `3 -> relay_1`, `4 -> relay_2`, `5 -> relay_1`.
 
-Different profile queues run concurrently. Multiple prompts assigned to the same profile run sequentially in input order. If there are fewer prompts than selected profiles, unused profiles are not called. One prompt is sent only to the first selected profile; it is never broadcast automatically.
+By default, prompt tasks run sequentially in input order and the batch stops before starting later tasks after the first failure. If there are fewer prompts than selected profiles, unused profiles are not called. One prompt is sent only to the first selected profile; it is never broadcast automatically.
+
+Run different profile queues concurrently only when that billing tradeoff is explicitly accepted:
+
+```bash
+python ~/.codex/skills/gpt-image-2-relay/scripts/generate.py \
+  --profiles relay_1,relay_2,relay_3 \
+  --parallel-profiles \
+  --prompt "A rainy Tokyo alley at night" \
+  --prompt "A transparent keycap containing a miniature greenhouse" \
+  --prompt "A Mars base at sunrise" \
+  --filename batch.png
+```
+
+In parallel mode, tasks already submitted continue after one fails. In both modes, transient or indeterminate failures wait for the relay's `retry_after` value or `--failure-wait` (default `120` seconds), then exit without resending.
 
 When multiple prompts are supplied, outputs include both the prompt index and profile, for example `batch--p001--relay-1.png`. `--n` controls images per prompt task and defaults to `1`; it does not change prompt assignment.
 

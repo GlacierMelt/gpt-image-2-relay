@@ -212,7 +212,7 @@ class RelayDriverTests(unittest.TestCase):
             self.assertIn("模型/实验-v3".encode("utf-8"), request["body"])
             self.assertIn(b'name="image"; filename="source.png"', request["body"])
 
-    def test_standard_model_keeps_imagegen_driver(self):
+    def test_explicit_imagegen_driver_is_kept(self):
         with tempfile.TemporaryDirectory() as temp_value:
             temp = Path(temp_value)
             auth = temp / "relay.json"
@@ -235,6 +235,8 @@ class RelayDriverTests(unittest.TestCase):
                 str(auth),
                 "--workspace",
                 str(temp),
+                "--driver",
+                "imagegen",
                 "--python",
                 sys.executable,
                 "--image-cli",
@@ -248,6 +250,34 @@ class RelayDriverTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("relay driver: imagegen (model: gpt-image-2)", result.stdout)
             self.assertIn('"gpt-image-2"', result.stdout)
+
+    def test_standard_model_defaults_to_single_attempt_direct_driver(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = Path(temp_value)
+            auth = temp / "relay.json"
+            auth.write_text(
+                json.dumps(
+                    {
+                        "OPENAI_API_KEY": "test-key",
+                        "OPENAI_BASE_URL": "http://127.0.0.1:9/api/v1",
+                    }
+                )
+            )
+
+            result = run_cli(
+                "--image-auth-json",
+                str(auth),
+                "--workspace",
+                str(temp),
+                "--prompt",
+                "test prompt",
+                "--dry-run",
+                cwd=temp,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("relay driver: openai-images (model: gpt-image-2)", result.stdout)
+            self.assertNotIn("relay driver: imagegen", result.stdout)
 
     def test_prefixed_custom_model_uses_direct_driver_in_auto_mode(self):
         with tempfile.TemporaryDirectory() as temp_value:

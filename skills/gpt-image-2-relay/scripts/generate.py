@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+from http.client import HTTPException
 import json
 import mimetypes
 import os
@@ -30,17 +31,12 @@ from urllib.request import Request, urlopen
 
 DEFAULT_IMAGE_AUTH_JSON = Path.home() / ".codex" / "gpt-image-2-relay-auth.json"
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_DRIVER = "auto"
+DEFAULT_DRIVER = "openai-images"
 DEFAULT_SIZE = "1024x1024"
 DEFAULT_QUALITY = "medium"
 DEFAULT_RESPONSE_FORMAT = "url"
 DEFAULT_REQUEST_TIMEOUT = 600.0
-KNOWN_IMAGEGEN_MODELS = {
-    "gpt-image-2",
-    "gpt-image-1.5",
-    "gpt-image-1",
-    "gpt-image-1-mini",
-}
+DEFAULT_FAILURE_WAIT = 120.0
 KEY_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
 BASE_URL_KEYS = ("OPENAI_BASE_URL", "base_url", "BASE_URL", "url")
 JSON_API_KEY_KEYS = ("OPENAI_API_KEY", "api_key")
@@ -67,6 +63,9 @@ class DriverResult:
     stdout: str = ""
     stderr: str = ""
     outputs: tuple[str, ...] = ()
+    wait_recommended: bool = False
+    duplicate_billing_risk: bool = False
+    retry_after_seconds: float | None = None
 
 
 @dataclass
@@ -89,6 +88,19 @@ class ProfileAttemptResult:
 
 class RelayRequestError(RuntimeError):
     """Readable HTTP, response, or download error from a direct relay."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        wait_recommended: bool = False,
+        duplicate_billing_risk: bool = False,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.wait_recommended = wait_recommended
+        self.duplicate_billing_risk = duplicate_billing_risk
+        self.retry_after_seconds = retry_after_seconds
 
 
 class OrderedPromptAction(argparse.Action):
@@ -356,7 +368,7 @@ def resolve_driver(value: Any, model: str) -> str:
         choices = ", ".join(sorted(DRIVER_ALIASES))
         fail(f"unknown relay driver {requested!r}; choose one of: {choices}")
     if driver == "auto":
-        return "imagegen" if model in KNOWN_IMAGEGEN_MODELS else "openai-images"
+        return "openai-images"
     return driver
 
 
@@ -567,6 +579,43 @@ def compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def parse_wait_seconds(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, 3600.0)
+
+
+def retry_after_from_response(headers: Any, detail: Any) -> float | None:
+    header_value = headers.get("Retry-After") if headers is not None else None
+    header_seconds = parse_wait_seconds(header_value)
+    if header_seconds is not None:
+        return header_seconds
+
+    def find(value: Any) -> float | None:
+        if isinstance(value, dict):
+            direct = parse_wait_seconds(value.get("retry_after"))
+            if direct is not None:
+                return direct
+            for child in value.values():
+                found = find(child)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find(child)
+                if found is not None:
+                    return found
+        return None
+
+    return find(detail)
+
+
 def embedded_error(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
@@ -620,16 +669,38 @@ def request_relay_json(
             result = decode_json_body(response.read(), response.headers.get("Content-Type"))
     except HTTPError as exc:
         raw = exc.read()
+        detail: Any = None
         try:
             detail = decode_json_body(raw, exc.headers.get("Content-Type"))
             message = embedded_error(detail) or compact_json(detail)
         except RelayRequestError:
             message = raw.decode("utf-8", errors="replace")[:2000]
-        raise RelayRequestError(f"HTTP {exc.code} from {safe_base_url(url)}: {message}") from exc
+        transient = exc.code in {408, 425, 429} or 500 <= exc.code <= 599
+        duplicate_risk = exc.code == 408 or 500 <= exc.code <= 599
+        raise RelayRequestError(
+            f"HTTP {exc.code} from {safe_base_url(url)}: {message}",
+            wait_recommended=transient,
+            duplicate_billing_risk=duplicate_risk,
+            retry_after_seconds=retry_after_from_response(exc.headers, detail),
+        ) from exc
     except URLError as exc:
-        raise RelayRequestError(f"request failed for {safe_base_url(url)}: {exc.reason}") from exc
+        raise RelayRequestError(
+            f"request failed for {safe_base_url(url)}: {exc.reason}",
+            wait_recommended=True,
+            duplicate_billing_risk=True,
+        ) from exc
     except TimeoutError as exc:
-        raise RelayRequestError(f"request timed out for {safe_base_url(url)}") from exc
+        raise RelayRequestError(
+            f"request timed out for {safe_base_url(url)}",
+            wait_recommended=True,
+            duplicate_billing_risk=True,
+        ) from exc
+    except (HTTPException, ConnectionError, OSError) as exc:
+        raise RelayRequestError(
+            f"connection closed for {safe_base_url(url)}: {exc}",
+            wait_recommended=True,
+            duplicate_billing_risk=True,
+        ) from exc
 
     message = embedded_error(result)
     if message:
@@ -854,6 +925,7 @@ def run_openai_images_driver(
         print(f"Dry-run output path: {out}")
         return DriverResult(0, outputs=(str(out),))
 
+    response_received = False
     try:
         if command == "generate":
             response = request_relay_json(
@@ -878,6 +950,7 @@ def run_openai_images_driver(
                 body=body,
                 content_type=content_type,
             )
+        response_received = True
         saved = save_relay_images(
             response,
             out,
@@ -888,7 +961,14 @@ def run_openai_images_driver(
         )
     except RelayRequestError as exc:
         message = sanitize(str(exc), api_key)
-        return DriverResult(1, stderr=f"Direct relay request failed: {message}\n")
+        duplicate_risk = exc.duplicate_billing_risk or response_received
+        return DriverResult(
+            1,
+            stderr=f"Direct relay request failed: {message}\n",
+            wait_recommended=exc.wait_recommended or duplicate_risk,
+            duplicate_billing_risk=duplicate_risk,
+            retry_after_seconds=exc.retry_after_seconds,
+        )
 
     for path in saved:
         print(f"Final output: {path}")
@@ -983,11 +1063,31 @@ def run_image_command(
         print(f"Dry-run output path: {out}")
     elif result.returncode == 0:
         print(f"Final output: {out}")
+    failure_text = f"{result.stdout}\n{result.stderr}".lower()
+    duplicate_risk = result.returncode != 0 and any(
+        marker in failure_text
+        for marker in (
+            "timed out",
+            "timeout",
+            "remote disconnected",
+            "remote end closed",
+            "connection reset",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "http 520",
+            "http 522",
+            "http 524",
+        )
+    )
     return DriverResult(
         returncode=result.returncode,
         stdout=result.stdout,
         stderr=result.stderr,
         outputs=(str(out),) if result.returncode == 0 else (),
+        wait_recommended=duplicate_risk,
+        duplicate_billing_risk=duplicate_risk,
     )
 
 
@@ -1030,6 +1130,37 @@ def run_relay_attempt(
     return result
 
 
+def wait_after_failure(result: DriverResult, args: argparse.Namespace, label: str) -> None:
+    if result.returncode == 0 or args.dry_run or not result.wait_recommended:
+        return
+
+    wait_seconds = max(
+        float(args.failure_wait),
+        float(result.retry_after_seconds or 0.0),
+    )
+    if result.duplicate_billing_risk:
+        print(
+            f"{label} ended without a reliable final result and may already be billable. "
+            "No automatic retry will be sent.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if wait_seconds <= 0:
+        return
+    print(
+        f"Waiting {wait_seconds:g} seconds after the failed request; "
+        "remaining prompt tasks will not start.",
+        file=sys.stderr,
+        flush=True,
+    )
+    time.sleep(wait_seconds)
+    print(
+        "Failure wait complete. Automatic resend remains disabled.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def execute_profile_attempt(attempt: ProfileAttempt, workspace: Path) -> ProfileAttemptResult:
     started = time.monotonic()
     try:
@@ -1047,7 +1178,12 @@ def execute_profile_attempt(attempt: ProfileAttempt, workspace: Path) -> Profile
     except Exception as exc:
         message = sanitize(str(exc), attempt.api_key)
         print(f"Profile {attempt.name!r} failed unexpectedly: {message}", file=sys.stderr)
-        result = DriverResult(1, stderr=f"unexpected profile failure: {message}\n")
+        result = DriverResult(
+            1,
+            stderr=f"unexpected profile failure: {message}\n",
+            wait_recommended=True,
+            duplicate_billing_risk=True,
+        )
     return ProfileAttemptResult(
         prompt_index=attempt.prompt_index,
         name=attempt.name,
@@ -1063,7 +1199,7 @@ def execute_profile_queue(
     return [execute_profile_attempt(attempt, workspace) for attempt in attempts]
 
 
-def run_parallel_profiles(
+def run_multi_profiles(
     args: argparse.Namespace,
     image_auth_path: Path,
     workspace: Path,
@@ -1140,40 +1276,86 @@ def run_parallel_profiles(
         for attempt in imagegen_attempts:
             attempt.args.python = str(runtime)
 
-    queues: dict[str, list[ProfileAttempt]] = {}
-    for attempt in attempts:
-        queues.setdefault(attempt.name, []).append(attempt)
-
-    unused = [name for name, _config in selected if name not in queues]
+    assigned_profiles = {attempt.name for attempt in attempts}
+    unused = [name for name, _config in selected if name not in assigned_profiles]
     if unused:
         print("Selected profiles without an assigned prompt: " + ", ".join(unused))
 
     assignment = ", ".join(
         f"p{attempt.prompt_index:03d}->{attempt.name}" for attempt in attempts
     )
+    execution_mode = "parallel" if args.parallel_profiles else "guarded sequential"
     print(
-        f"Starting {len(attempts)} prompt task(s) across {len(queues)} relay profile(s): "
-        + assignment
+        f"Starting {len(attempts)} prompt task(s) across {len(assigned_profiles)} "
+        f"relay profile(s) in {execution_mode} mode: {assignment}"
     )
     if not args.dry_run:
         print(
             f"Each prompt task sends one API request with n={args.n} and may be billed."
         )
+    if args.parallel_profiles:
+        print(
+            "Parallel mode submits multiple billable requests before an early failure can stop the batch.",
+            file=sys.stderr,
+        )
 
     completed: dict[int, ProfileAttemptResult] = {}
-    with ThreadPoolExecutor(max_workers=len(queues), thread_name_prefix="image-relay") as executor:
-        futures = {
-            executor.submit(execute_profile_queue, queue, workspace): name
-            for name, queue in queues.items()
-        }
-        for future in as_completed(futures):
-            for outcome in future.result():
-                completed[outcome.prompt_index] = outcome
+    if args.parallel_profiles:
+        queues: dict[str, list[ProfileAttempt]] = {}
+        for attempt in attempts:
+            queues.setdefault(attempt.name, []).append(attempt)
+        with ThreadPoolExecutor(max_workers=len(queues), thread_name_prefix="image-relay") as executor:
+            futures = {
+                executor.submit(execute_profile_queue, queue, workspace): name
+                for name, queue in queues.items()
+            }
+            for future in as_completed(futures):
+                for outcome in future.result():
+                    completed[outcome.prompt_index] = outcome
 
-    print("Concurrent prompt summary:")
+        failed_outcomes = [
+            outcome for outcome in completed.values() if outcome.result.returncode != 0
+        ]
+        if failed_outcomes:
+            retry_after_values = [
+                outcome.result.retry_after_seconds
+                for outcome in failed_outcomes
+                if outcome.result.retry_after_seconds is not None
+            ]
+            batch_result = DriverResult(
+                1,
+                wait_recommended=any(
+                    outcome.result.wait_recommended for outcome in failed_outcomes
+                ),
+                duplicate_billing_risk=any(
+                    outcome.result.duplicate_billing_risk for outcome in failed_outcomes
+                ),
+                retry_after_seconds=max(retry_after_values) if retry_after_values else None,
+            )
+            wait_after_failure(batch_result, args, "Parallel batch")
+    else:
+        for attempt in attempts:
+            outcome = execute_profile_attempt(attempt, workspace)
+            completed[outcome.prompt_index] = outcome
+            if outcome.result.returncode != 0:
+                wait_after_failure(
+                    outcome.result,
+                    args,
+                    f"Prompt p{attempt.prompt_index:03d} on profile {attempt.name!r}",
+                )
+                break
+
+    print("Multi-profile prompt summary:")
     failed = False
     for attempt in attempts:
-        outcome = completed[attempt.prompt_index]
+        outcome = completed.get(attempt.prompt_index)
+        if outcome is None:
+            print(
+                f"- p{attempt.prompt_index:03d} -> {attempt.name}: "
+                "not started; stopped after an earlier failure"
+            )
+            failed = True
+            continue
         status = "ok" if outcome.result.returncode == 0 else f"failed ({outcome.result.returncode})"
         outputs = ", ".join(outcome.result.outputs)
         suffix = f"; outputs: {outputs}" if outputs else ""
@@ -1227,6 +1409,14 @@ def parse_args() -> argparse.Namespace:
             "N must be at least 2."
         ),
     )
+    parser.add_argument(
+        "--parallel-profiles",
+        action="store_true",
+        help=(
+            "Submit different profile queues concurrently. By default, multi-profile tasks run "
+            "sequentially and stop after the first failure to limit duplicate billing risk."
+        ),
+    )
     parser.add_argument("--python", help="Python executable to run the bundled imagegen CLI")
     parser.add_argument("--image-cli", default=str(default_cli_path()))
     parser.add_argument("--skip-install", action="store_true")
@@ -1247,6 +1437,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background")
     parser.add_argument("--upscale")
     parser.add_argument("--request-timeout", type=float)
+    parser.add_argument(
+        "--failure-wait",
+        type=float,
+        default=DEFAULT_FAILURE_WAIT,
+        help=(
+            "Seconds to wait after a transient or indeterminate request failure; default: "
+            f"{DEFAULT_FAILURE_WAIT:g}. Waiting never resends the request."
+        ),
+    )
     parser.add_argument("--extra-json", help="Additional JSON object for the openai-images request payload.")
     parser.add_argument("--use-case")
     parser.add_argument("--scene")
@@ -1284,9 +1483,13 @@ def main() -> int:
 
     if args.n < 1 or args.n > 10:
         fail("n must be between 1 and 10")
+    if args.failure_wait < 0 or args.failure_wait > 3600:
+        fail("failure-wait must be between 0 and 3600 seconds")
+    if args.parallel_profiles and not (args.profiles or args.profile_count is not None):
+        fail("--parallel-profiles requires --profiles or --profile-count")
 
     if args.profiles or args.profile_count is not None:
-        return run_parallel_profiles(args, image_auth_path, workspace)
+        return run_multi_profiles(args, image_auth_path, workspace)
 
     prompt_args = expand_prompt_args(args, workspace)
     if len(prompt_args) != 1:
@@ -1320,6 +1523,8 @@ def main() -> int:
         out=out,
         workspace=workspace,
     )
+    if result.returncode != 0:
+        wait_after_failure(result, args, label.capitalize())
     return result.returncode
 
 

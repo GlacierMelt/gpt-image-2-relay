@@ -27,6 +27,18 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "body": body,
             }
         )
+        if self.server.response_status != 200:
+            response = {
+                "error": "simulated relay failure",
+                "retry_after": 0,
+            }
+            encoded = json.dumps(response).encode("utf-8")
+            self.send_response(self.server.response_status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
         if self.server.barrier is not None:
             try:
                 self.server.barrier.wait(timeout=2)
@@ -52,13 +64,15 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 class LocalRelay:
-    def __init__(self, barrier=None):
+    def __init__(self, barrier=None, response_status=200):
         self.barrier = barrier
+        self.response_status = response_status
 
     def __enter__(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), RelayHandler)
         self.server.requests = []
         self.server.barrier = self.barrier
+        self.server.response_status = self.response_status
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
@@ -178,7 +192,7 @@ class MultiProfileTests(unittest.TestCase):
             self.assertEqual(relay.server.requests[0]["authorization"], "Bearer profile-key")
             self.assertNotIn("profile-key", result.stdout + result.stderr)
 
-    def test_standard_model_uses_imagegen_from_default_json(self):
+    def test_standard_model_defaults_to_direct_driver(self):
         with tempfile.TemporaryDirectory() as temp_value:
             temp = Path(temp_value)
             auth = temp / "relay.json"
@@ -190,21 +204,11 @@ class MultiProfileTests(unittest.TestCase):
                     }
                 )
             )
-            fake_cli = temp / "fake_imagegen.py"
-            fake_cli.write_text(
-                "import json, sys\n"
-                "print(json.dumps(sys.argv[1:]))\n"
-            )
-
             result = run_cli(
                 "--image-auth-json",
                 str(auth),
                 "--workspace",
                 str(temp),
-                "--python",
-                sys.executable,
-                "--image-cli",
-                str(fake_cli),
                 "--prompt",
                 "test prompt",
                 "--dry-run",
@@ -212,7 +216,7 @@ class MultiProfileTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("relay driver: imagegen (model: gpt-image-2)", result.stdout)
+            self.assertIn("relay driver: openai-images (model: gpt-image-2)", result.stdout)
             self.assertNotIn("default-key", result.stdout + result.stderr)
 
     def test_three_prompt_files_map_one_to_one_and_overlap(self):
@@ -256,6 +260,7 @@ class MultiProfileTests(unittest.TestCase):
             result = run_cli(
                 "--profiles",
                 "relay_1,relay_2,relay_3",
+                "--parallel-profiles",
                 *common_args(temp, auth, prompt=None),
                 "--prompt-file",
                 str(prompt_files[0]),
@@ -282,10 +287,61 @@ class MultiProfileTests(unittest.TestCase):
             self.assertEqual(relay_counts(second), [1])
             self.assertEqual(relay_counts(third), [1])
             self.assertIn("p001->relay_1, p002->relay_2, p003->relay_3", result.stdout)
-            self.assertIn("Concurrent prompt summary", result.stdout)
+            self.assertIn("Multi-profile prompt summary", result.stdout)
+            self.assertIn("in parallel mode", result.stdout)
             self.assertNotIn("first-key", result.stdout + result.stderr)
             self.assertNotIn("second-key", result.stdout + result.stderr)
             self.assertNotIn("third-key", result.stdout + result.stderr)
+
+    def test_guarded_sequential_mode_stops_after_first_indeterminate_failure(self):
+        with (
+            tempfile.TemporaryDirectory() as temp_value,
+            LocalRelay(response_status=524) as first,
+            LocalRelay() as second,
+        ):
+            temp = Path(temp_value)
+            auth = temp / "relay.json"
+            auth.write_text(
+                json.dumps(
+                    {
+                        "profiles": {
+                            "relay_1": {
+                                "OPENAI_API_KEY": "first-key",
+                                "OPENAI_BASE_URL": first.base_url,
+                            },
+                            "relay_2": {
+                                "OPENAI_API_KEY": "second-key",
+                                "OPENAI_BASE_URL": second.base_url,
+                            },
+                        }
+                    }
+                )
+            )
+
+            result = run_cli(
+                "--profiles",
+                "relay_1,relay_2",
+                *common_args(temp, auth, prompt=None),
+                "--failure-wait",
+                "0",
+                "--prompt",
+                "first prompt",
+                "--prompt",
+                "second prompt",
+                "--filename",
+                "guarded.png",
+                cwd=temp,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(len(first.server.requests), 1)
+            self.assertEqual(len(second.server.requests), 0)
+            self.assertIn("in guarded sequential mode", result.stdout)
+            self.assertIn(
+                "p002 -> relay_2: not started; stopped after an earlier failure",
+                result.stdout,
+            )
+            self.assertIn("No automatic retry will be sent", result.stderr)
 
     def test_more_prompts_than_profiles_are_round_robin_without_duplicates(self):
         with (
