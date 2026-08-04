@@ -73,6 +73,24 @@ Each profile normally needs only `OPENAI_API_KEY` and `OPENAI_BASE_URL`. Keep th
 
 Model IDs and size values are opaque relay values. Custom values such as `特惠image2`, `gpt-image-2-4K 高质量线路`, `3:2`, and `21:9` require no code changes.
 
+## Billing and Failure Safety
+
+Each prompt task sends one image API request. `--n 2` still sends one request per prompt, but asks that request to return up to two images.
+
+| Mode | Enable with | Submission behavior | First failure |
+| --- | --- | --- | --- |
+| Guarded sequential (default) | `--profiles` or `--profile-count` | Submit one prompt task at a time | Wait, stop, and leave later tasks unstarted |
+| Explicit parallel | Add `--parallel-profiles` | Submit different profile queues concurrently | Let already submitted tasks finish, then wait and stop |
+
+Timeouts, disconnects, HTTP `408`, and HTTP `5xx` are indeterminate outcomes: the relay may already have accepted and billed the request even when no image reaches the client. The wrapper therefore:
+
+- sends every prompt task at most once per invocation;
+- uses the direct `openai-images` driver by default so an SDK cannot retry invisibly;
+- waits for the relay's `retry_after` value or `--failure-wait` (default `120` seconds);
+- never resends, lowers quality, changes model, or reruns the batch automatically.
+
+The failure wait is a cooldown, not a retry. Sending another potentially billable attempt requires a new explicit command. Use `imagegen` only when its SDK-level retry behavior is explicitly accepted.
+
 ## Use in Codex Chat
 
 Select the `gpt-image-2-relay` skill in Codex or include `$gpt-image-2-relay` in the message. Describe the profiles, ordered prompts, and `n` in natural language; Codex will call the wrapper, so shell commands are not required.
@@ -104,6 +122,22 @@ To run the same case with real generation, replace the first sentence with:
 ```text
 使用 $gpt-image-2-relay 真实生图。开始前先报告分配关系和总请求数，然后生成并检查全部结果。
 ```
+
+To explicitly submit five profiles in parallel:
+
+```text
+使用 $gpt-image-2-relay --parallel-profiles。
+使用前 5 个已配置 profiles，每段提示词只请求一次：
+1. 白色背景上的透明玻璃相机，产品摄影
+2. 深海中的发光水下车站，电影概念设计
+3. 秋日森林里的现代图书馆，建筑摄影
+4. 月球表面的复古咖啡车，写实摄影
+5. 巨型花朵中的微型钟表工坊，微距摄影
+
+开始前报告 5 个可能计费的请求；失败后只等待并报告，不要自动重发。
+```
+
+Expected routing is `p001 -> relay_1` through `p005 -> relay_5`. Because parallel mode is explicit, all five requests may be in flight before the first failure is known.
 
 Test more prompts than APIs with:
 
